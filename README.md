@@ -27,11 +27,12 @@ Use the host's `plugin_manager` bundle operations when available. Installing the
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `modelSurface` | `auto` | `always` mounts four tools and guidance even when a preset roster exists. `auto` defers model-surface registration in roster deployments. |
+| `outputReserveTokens` | `min(32768, floor(C * 0.25))` | Budget-only output reserve when the resolved request has no maxTokens; does not alter the provider request. |
 | `bufferTokens` | `min(16384, floor(H * 0.15))` | Positive integer fallback reserve, B. |
 | `reminderTokens` | `min(6144, floor(W * 0.1))` | Positive integer reminder distance, R. |
-| `models` | `{}` | Exact `provider:model` keys with optional `bufferTokens` / `reminderTokens` overrides. |
+| `models` | `{}` | Exact `provider:model` keys with optional `outputReserveTokens` / `bufferTokens` / `reminderTokens` overrides. |
 
-The effective model context window is C; resolved request-header `maxTokens` is the output reserve O (including adapter defaults). H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C/O and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `measurement: awaiting_first_request` and null numeric headroom; subsequent budget reads are estimates, not provider token counts.
+The effective model context window is C; an explicit resolved request-header `maxTokens` is the output reserve O (including adapter defaults). When the request legitimately has no cap, O uses the configured budget-only reserve or the table default. Budget reads label `output_reserve_source` as `request-maxTokens` or `policy-estimate`; the latter does not claim to know the provider output limit. H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C, invalid explicit caps/reserves and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `measurement: awaiting_first_request` and null numeric headroom; subsequent budget reads are estimates, not provider token counts.
 
 At W − R the engine sends one reminder per window; at W it sends one save-notes fallback with current committed references. At H or provider overflow it resets at a safe native boundary. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
 

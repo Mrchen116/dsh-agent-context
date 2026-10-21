@@ -291,6 +291,7 @@ export interface EngineHarness {
 export async function engineHarness(
   id: string,
   config: Partial<RolloverConfig> = {},
+  options: { maxTokens?: number } = { maxTokens: 10000 },
 ): Promise<EngineHarness> {
   const ctx = await mountTestContext()
   const notesBase = await tempNotesDir()
@@ -306,7 +307,7 @@ export async function engineHarness(
   const engine = new ContextRolloverEngine(ctx, config)
   const agent = await harnesses
     .get(ctx)!
-    .create(SessionId(id), { provider: MODEL, model: MODEL, maxTokens: 10000 })
+    .create(SessionId(id), { provider: MODEL, model: MODEL, ...options })
   return { ctx, engine, agent, session: agent.session, notesBase }
 }
 

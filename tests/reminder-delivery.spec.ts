@@ -65,3 +65,22 @@ it('delivers reminder and fallback once per window, with committed references, i
   expect(currentWindow(restored).window_id).toBe(`${session.id}:initial`)
   await fresh.fiber.dispose()
 })
+
+it('continues uncapped model requests using a labeled output reserve without changing the request cap', async () => {
+  const { ctx, agent, session } = await engineHarness('uncapped-budget', {}, {})
+  const adapter = new ScriptedAdapter([textResponse('one'), textResponse('two')])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'first task')
+  await followup(agent, 'next task')
+  expect(adapter.requests).toHaveLength(2)
+  expect(session.snapshotEvents().at(-1)).toMatchObject({
+    type: 'turn/end',
+    data: { reason: { kind: 'completed' } },
+  })
+  expect(session.requestHeader()?.config.maxTokens).toBeUndefined()
+  const { budget } = await import('../src/budget.ts')
+  expect(budget(agent, ctx.tokenMeter, { modelSurface: 'always' })).toMatchObject({
+    O: 25000,
+    output_reserve_source: 'policy-estimate',
+  })
+})

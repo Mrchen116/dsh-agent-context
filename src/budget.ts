@@ -16,23 +16,25 @@ export function budget(
   const session = agent.session
   const context = session.requestContext()
   const C = context?.contextWindow
-  const O =
+  if (C === undefined || !Number.isFinite(C) || C <= 0)
+    throw new Error('agent-context: a valid model contextWindow is required')
+  const model = `${context?.provider}:${context?.model}`
+  const override = config.models?.[model] ?? {}
+  const requestMaxTokens =
     header?.config.maxTokens ??
     session.requestHeader()?.config.maxTokens ??
     agent.options.maxTokens
-  if (
-    C === undefined ||
-    O === undefined ||
-    !Number.isFinite(C) ||
-    !Number.isFinite(O) ||
-    C <= O ||
-    O <= 0
-  )
+  // DSH intentionally leaves maxTokens absent for uncapped requests. Reserve
+  // working space without changing that request or claiming a provider limit.
+  const O =
+    requestMaxTokens ??
+    override.outputReserveTokens ??
+    config.outputReserveTokens ??
+    Math.min(32768, Math.floor(C * 0.25))
+  if (!Number.isFinite(O) || O <= 0 || C <= O)
     throw new Error(
-      'agent-context: valid model contextWindow and maxTokens output reserve are required',
+      'agent-context: output reserve must be positive and below contextWindow',
     )
-  const model = `${context?.provider}:${context?.model}`
-  const override = config.models?.[model] ?? {}
   const H = C - O
   const B =
     override.bufferTokens ??
@@ -74,6 +76,8 @@ export function budget(
       .filter((m) => !persisted.has(m.id))
       .reduce((n, m) => n + meter.estimateMessage(m), 0)
   return {
+    output_reserve_source:
+      requestMaxTokens === undefined ? 'policy-estimate' : 'request-maxTokens',
     fixed_tokens: fixedTokens,
     remaining: Math.max(0, W - T),
     T,
