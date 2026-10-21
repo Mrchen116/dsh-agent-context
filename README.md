@@ -34,7 +34,7 @@ Use the host's `plugin_manager` bundle operations when available. Installing the
 
 The effective model context window is C; an explicit resolved request-header `maxTokens` is the output reserve O (including adapter defaults). When the request legitimately has no cap, O uses the configured budget-only reserve or the table default. Budget reads label `output_reserve_source` as `request-maxTokens` or `policy-estimate`; the latter does not claim to know the provider output limit. H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C, invalid explicit caps/reserves and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `measurement: awaiting_first_request` and null numeric headroom; subsequent budget reads are estimates, not provider token counts.
 
-At W − R the engine sends one reminder per window; at W it sends one save-notes fallback with current committed references. At H or provider overflow it resets at a safe native boundary. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
+At W − R the engine sends one reminder per window. At W it first calls the host's public `toolResultPruner.pruneSession()` when available and remeasures the same pending request. If pressure remains, it sends one save-notes fallback with current committed references at W or resets at H. Provider overflow applies native pruning before the existing reset at a safe native boundary. Explicit `new_context` and manual resets remain explicit resets. The plugin reuses the host pruner's configuration and durable source-preserving replacements; it does not implement another truncation algorithm or change the host's per-result spill policy. Without that optional host service, the previous budget/reset behavior remains. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
 
 ## Model tools
 
@@ -63,7 +63,7 @@ History preserves original provenance, full tool arguments and persisted result 
 
 List/search accept `window_id`, `role`, `tool_name`, `recent_first` (true), `limit` (20, maximum 100), and a directional `cursor`. Item snippets use `max_chars_per_item` (1000, maximum 4000). `read` requires `window_id` and `item_id`, with `offset_chars` (0) and `limit_chars` (12000, maximum 20000), returning `total_chars`, `next_offset_chars`, and `truncated`.
 
-A dynamic `<context_references>` snapshot of currently active persisted messages provides at most 32 references and 4000 bytes. A full reset starts with an empty reference snapshot; archived items are addressed through History. New inputs appear in the next assembly; `get_context_remaining` can obtain their references sooner after persistence. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
+The `get_context_remaining` reference page of currently active persisted messages provides at most 32 references and 4000 bytes. It is queried on demand; ordinary steps and Notes writes do not change the runtime prompt. The exhausted-window fallback also includes a reference snapshot. A full reset starts with an empty reference snapshot; archived items are addressed through History. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
 
 ## Development and packaging
 
@@ -75,7 +75,10 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack
-shasum -a 256 dsh-agent-context-0.3.0-rc.1.tgz
+shasum -a 256 dsh-agent-context-0.3.0-rc.4.tgz
 ```
 
 The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
+
+
+Only window identity changes the ordinary runtime context contribution. Notes hints appear when a window is constructed; Skill catalogs belong to the host. Prior content is recovered through the original Notes and window/item History tools, without a separate current-turn recovery protocol.

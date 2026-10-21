@@ -1,4 +1,4 @@
-import { mkdtemp, rm, symlink, chmod, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, symlink, chmod, readFile, utimes } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
@@ -69,3 +69,17 @@ it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
     expect(await readFile(path, 'utf8')).toBe('preserve me')
   },
 )
+
+it('renders the Codex recent-notes hint with newest-first paths and line/UTF-8 counts', async () => {
+  const s = await store()
+  expect(await s.hint()).toBe('')
+  await s.write('checkpoint', 'old')
+  await s.write('on-checkpoint', '新状态\ncontinue')
+  await utimes(join(s.root, 'checkpoint'), 1000, 1000)
+  await utimes(join(s.root, 'on-checkpoint'), 2000, 2000)
+  expect(await s.hint()).toBe(
+    'Recent notes (up to 5, most-recent first):\n' +
+    '- on-checkpoint (2 lines, 18 UTF-8 bytes)\n' +
+    '- checkpoint (1 lines, 3 UTF-8 bytes)',
+  )
+})

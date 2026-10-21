@@ -229,14 +229,15 @@ export class NotesStore {
   }
   /** Navigation only: never inject note bodies into a new window. */
   async hint(): Promise<string> {
-    const paths: string[] = []
+    const header = 'Recent notes (up to 5, most-recent first):'
+    const entries: string[] = []
     for (const file of (await this.listings()).slice(0, 5)) {
-      const candidate = `<recent_notes>\n${[...paths, JSON.stringify(file.path)].join('\n')}\n</recent_notes>`
+      const lines = (await this.read(file.path)).split('\n').length
+      const entry = `- ${file.path} (${lines} lines, ${file.bytes} UTF-8 bytes)`
+      const candidate = [header, ...entries, entry].join('\n')
       if (Buffer.byteLength(candidate) > 4000) break
-      paths.push(JSON.stringify(file.path))
+      entries.push(entry)
     }
-    return paths.length
-      ? `<recent_notes>\n${paths.join('\n')}\n</recent_notes>`
-      : ''
+    return entries.length ? [header, ...entries].join('\n') : ''
   }
 }

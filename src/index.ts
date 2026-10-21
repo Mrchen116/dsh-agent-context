@@ -3,6 +3,7 @@ import {
   CompactionEngine,
   ManualCompactionError,
 } from '@deepseek-ai/dsh-compaction'
+import type {} from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import type {
   CompactionResult,
   CompactionTrigger,
@@ -105,7 +106,7 @@ export class ContextRolloverEngine extends CompactionEngine {
         order: 2350,
         text: ({ agent }) =>
           agent
-            ? `${windowText(agent.session, agent.id)}\n${referenceText(agent.session)}`
+            ? windowText(agent.session, agent.id)
             : '',
       })
     }
@@ -113,9 +114,6 @@ export class ContextRolloverEngine extends CompactionEngine {
       const assembly = await next()
       const agent = context.agent
       if (agent && !this.ownedElsewhere(agent)) {
-        const hint = await this.notes(agent).hint()
-        const own = assembly.contexts.find((c) => c.name === CONTEXT_NAME)
-        if (own && hint) own.text += `\n${hint}`
         this.assemblies.set(agent, assembly)
       }
       return assembly
@@ -138,17 +136,18 @@ export class ContextRolloverEngine extends CompactionEngine {
         )
           ? 'model-requested'
           : undefined
+        const measure = () => budget(
+          agent,
+          ctx.tokenMeter,
+          this.config,
+          decision.messages,
+          this.header(agent, assembly),
+          createSystemMessage(renderPrompt(assembly)),
+        )
         const reading =
           agent.session.requestContext() === undefined
             ? undefined
-            : budget(
-                agent,
-                ctx.tokenMeter,
-                this.config,
-                decision.messages,
-                this.header(agent, assembly),
-                createSystemMessage(renderPrompt(assembly)),
-              )
+            : reason ? measure() : this.prunePressure(agent, measure)
         if (reading && reading.T >= reading.H) reason ??= 'pressure'
         if (reason) {
           this.pendingRollovers.delete(agent.session.id)
@@ -223,6 +222,14 @@ export class ContextRolloverEngine extends CompactionEngine {
         : next()
     })
   }
+  /** Reuse the host's native pruning transaction before spending the fallback reserve. */
+  private prunePressure(agent: Agent, measure: () => ReturnType<typeof budget>) {
+    const reading = measure()
+    const pruner = this.ctx.get('toolResultPruner')
+    if (reading.T < reading.W || pruner === undefined) return reading
+    pruner.pruneSession(agent.session)
+    return measure()
+  }
   private notes(agent: Agent) {
     return new NotesStore(NotesStore.directoryFor(agent.id, agent.session.id))
   }
@@ -269,6 +276,7 @@ export class ContextRolloverEngine extends CompactionEngine {
     sourceCommandId?: CommandId,
   ): Promise<CompactionResult> {
     signal.throwIfAborted()
+    if (reason === 'overflow') this.ctx.get('toolResultPruner')?.pruneSession(agent.session)
     const assembly =
       provided ??
       (await this.ctx.systemPrompt.assemble(assembleContextFor(agent, signal)))
@@ -331,10 +339,11 @@ export class ContextRolloverEngine extends CompactionEngine {
     signal: AbortSignal,
   ): Promise<CompactionResult | null> {
     if (this.ownedElsewhere(agent)) return null
+    signal.throwIfAborted()
     if (trigger === 'context-overflow')
       return this.perform(agent, 'overflow', signal)
     if (!agent.session.requestContext()) return null
-    const reading = budget(agent, this.ctx.tokenMeter, this.config)
+    const reading = this.prunePressure(agent, () => budget(agent, this.ctx.tokenMeter, this.config))
     if (reading.T < reading.H) return null
     return this.perform(agent, 'pressure', signal)
   }
