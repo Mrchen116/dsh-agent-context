@@ -102,3 +102,31 @@ it('continues three useful windows in one turn without an LLM summary request', 
     session.snapshotEvents().filter((e) => e.type === 'turn/start'),
   ).toHaveLength(1)
 })
+
+it('does not copy unchanged runtime instructions for ordinary progress or Notes changes', async () => {
+  const { ctx, engine, agent } = await engineHarness('stable-context')
+  ctx.systemPrompt.context({
+    name: 'restored-instructions',
+    order: 10,
+    text: 'STABLE_SKILL_BODY ' + 'instructions '.repeat(1000),
+  })
+  const adapter = new ScriptedAdapter([
+    textResponse('old material '.repeat(2000)),
+    toolCall('notes', JSON.stringify({ action: 'write', path: 'new.md', text: 'progress' }), 'n1'),
+    toolCall('notes', JSON.stringify({ action: 'read', path: 'new.md' }), 'n2'),
+    toolCall('get_context_remaining', '{}', 'b1'),
+    toolCall('notes', JSON.stringify({ action: 'append', path: 'new.md', text: 'next' }), 'n3'),
+    toolCall('notes', JSON.stringify({ action: 'read', path: 'new.md' }), 'n4'),
+    textResponse('probe complete'),
+  ])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'previous task')
+  await engine.compactNow(agent, new AbortController().signal)
+  await followup(agent, 'new task')
+  const copies = adapter.requests.slice(1).map(request => request.flatMap(message =>
+    message.content.filter(block => block.type === 'text').map(block => block.text),
+  ).join('\n').split('STABLE_SKILL_BODY').length - 1)
+  expect(copies).toHaveLength(6)
+  expect(copies[0]).toBeGreaterThan(0)
+  expect(copies).toEqual(Array(6).fill(copies[0]))
+})

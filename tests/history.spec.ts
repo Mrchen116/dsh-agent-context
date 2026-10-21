@@ -17,6 +17,7 @@ import {
   readHistoryItem,
   listWindows,
   references,
+  interruptedTurn,
 } from '../src/history.ts'
 import { commitRollover, selectRolloverRange } from '../src/rollover.ts'
 declare module '@deepseek-ai/dsh-llm' {
@@ -25,7 +26,7 @@ declare module '@deepseek-ai/dsh-llm' {
     'nano-system': { kind: 'nano-system'; origin: string }
   }
 }
-async function archive(session: Session) {
+async function archive(session: Session, owner: 'current-turn' | null = null) {
   const ctx = new Context()
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(TokenMeter)
@@ -36,7 +37,7 @@ async function archive(session: Session) {
     range.start,
     range.end,
     {
-      owner: null,
+      owner,
       checkpoint: {
         reason: 'manual',
         agentId: session.id,
@@ -220,4 +221,37 @@ it('paginates a bounded reference index without exposing runtime snapshots', asy
     cursor = result.next_cursor ?? undefined
   } while (cursor)
   expect(new Set(ids).size).toBe(80)
+})
+
+it('recovers one interrupted turn across windows without conflating earlier work or active content', async () => {
+  const s = Session.create(SessionId('multi-turn'))
+  const add = (text: string) => s.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: text + ' padding'.repeat(3000) }], source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  const old = s.append('turn/start', { turn: 1 })
+  add('OLD_DONE')
+  s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  expect(interruptedTurn(s, s.surface.nodes)).toBeUndefined()
+  const current = s.append('turn/start', { turn: 2 })
+  const first = add('CURRENT_REQUEST')
+  const navigation = interruptedTurn(s, s.surface.nodes)!
+  expect(navigation.turn_id).toBe(String(current.seq))
+  expect(navigation.item_count).toBe(1)
+  expect(JSON.stringify(navigation)).not.toContain('CURRENT_REQUEST')
+  expect(Buffer.byteLength(JSON.stringify(navigation))).toBeLessThanOrEqual(4000)
+  await archive(s, 'current-turn')
+  const second = add('CONTINUING_SAME_TASK')
+  await archive(s, 'current-turn')
+  add('STILL_ACTIVE')
+  const replay = Session.create(s.id, s.snapshotEvents())
+  const page = searchHistory(replay, { turn_id: String(current.seq), limit: 1, recent_first: false })
+  expect(page.items[0]!.item_id).toBe(String(first.seq))
+  const next = searchHistory(replay, { turn_id: String(current.seq), limit: 1, recent_first: false, cursor: page.next_cursor! })
+  expect(next.items[0]!.item_id).toBe(String(second.seq))
+  expect(next.items[0]!.window_id).not.toBe(page.items[0]!.window_id)
+  expect(next.next_cursor).toBeNull()
+  expect(searchHistory(replay, { turn_id: String(old.seq) }).items).toHaveLength(1)
+  expect(searchHistory(replay, { turn_id: String(current.seq), query: 'OLD_DONE' }).items).toEqual([])
+  expect(searchHistory(replay, { turn_id: 'missing' }).items).toEqual([])
+  expect(searchHistory(replay, { turn_id: String(current.seq), query: 'STILL_ACTIVE' }).items).toEqual([])
 })

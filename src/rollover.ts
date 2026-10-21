@@ -16,7 +16,7 @@ import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionSeq as Seq } from '@deepseek-ai/dsh-session'
-import { windows } from './history.ts'
+import { windows, interruptedTurn } from './history.ts'
 import { buildCheckpointText } from './checkpoint.ts'
 import type { CheckpointInput } from './checkpoint.ts'
 
@@ -262,7 +262,7 @@ export async function commitRollover(
     )
 
     const checkpointText = buildCheckpointText(
-      options.checkpoint,
+      { ...options.checkpoint, interruptedTurn: interruptedTurn(session, selection.shadowedSeqs) },
       `${session.id}:${startEvent.seq}`,
     )
     const checkpointMessage = createUserMessage({

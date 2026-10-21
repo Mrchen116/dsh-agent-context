@@ -63,7 +63,7 @@ History preserves original provenance, full tool arguments and persisted result 
 
 List/search accept `window_id`, `role`, `tool_name`, `recent_first` (true), `limit` (20, maximum 100), and a directional `cursor`. Item snippets use `max_chars_per_item` (1000, maximum 4000). `read` requires `window_id` and `item_id`, with `offset_chars` (0) and `limit_chars` (12000, maximum 20000), returning `total_chars`, `next_offset_chars`, and `truncated`.
 
-A dynamic `<context_references>` snapshot of currently active persisted messages provides at most 32 references and 4000 bytes. A full reset starts with an empty reference snapshot; archived items are addressed through History. New inputs appear in the next assembly; `get_context_remaining` can obtain their references sooner after persistence. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
+The `get_context_remaining` reference page of currently active persisted messages provides at most 32 references and 4000 bytes. It is queried on demand; ordinary steps and Notes writes do not change the runtime prompt. The exhausted-window fallback also includes a reference snapshot. A full reset starts with an empty reference snapshot; archived items are addressed through History. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
 
 ## Development and packaging
 
@@ -79,3 +79,12 @@ shasum -a 256 dsh-agent-context-0.3.0-rc.1.tgz
 ```
 
 The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
+
+
+### Interrupted work recovery
+
+History items expose `turn_id`, the owning native `turn/start` event sequence as an opaque string (or null outside a turn). `history` actions `list_items` and `search` accept an exact `turn_id` filter across archived windows of the current session.
+
+When a reset removes messages from the currently open turn, its durable checkpoint includes a body-free `<interrupted_turn>` with bounded item references and a paginated History query. The model must recover original inputs and prior deliveries before continuing or concluding: existing Notes may predate a newly read Inbox task. An idle manual reset does not invent interrupted work. Runtime environment reconstruction remains in the native compaction transaction; only window identity changes its ordinary context contribution.
+
+These on-demand reference and interrupted-turn instructions adapt the Codex baseline for DSH's cumulative runtime snapshots. Golden fixtures retain the original text and record the changed adaptation; they do not claim that this recovery protocol is verbatim upstream Codex behavior.

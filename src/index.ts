@@ -105,7 +105,7 @@ export class ContextRolloverEngine extends CompactionEngine {
         order: 2350,
         text: ({ agent }) =>
           agent
-            ? `${windowText(agent.session, agent.id)}\n${referenceText(agent.session)}`
+            ? windowText(agent.session, agent.id)
             : '',
       })
     }
@@ -113,9 +113,6 @@ export class ContextRolloverEngine extends CompactionEngine {
       const assembly = await next()
       const agent = context.agent
       if (agent && !this.ownedElsewhere(agent)) {
-        const hint = await this.notes(agent).hint()
-        const own = assembly.contexts.find((c) => c.name === CONTEXT_NAME)
-        if (own && hint) own.text += `\n${hint}`
         this.assemblies.set(agent, assembly)
       }
       return assembly
