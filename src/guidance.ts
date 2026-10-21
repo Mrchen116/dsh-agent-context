@@ -1,34 +1,11 @@
-/**
- * Stable context-management guidance for the model. Kept deliberately small:
- * the same text ships with every request until a rollover replaces it.
- *
- * @module dsh-context-rollover/guidance
- */
-
-/** System-prompt section text for the context-management plugin. */
-export const CONTEXT_MANAGEMENT_GUIDANCE = `
-# Context management
-
-Your active context is temporary working memory. Older conversation leaves your
-active context at a context rollover; it stays recoverable through the history
-tool.
-
-- Keep goal, verified progress, important decisions, constraints, files
-  involved, known failures, and next steps in notes. Update notes as facts
-  change; explicitly mark unverified hypotheses as hypotheses.
-- You may call new_context at a natural task boundary when carrying the
-  exploratory working context forward would only add noise — for example after
-  finishing research before starting implementation, or after a major phase
-  before verification. Before rolling over, save what the next context actually
-  needs to notes and pass a short handoff.
-- After a rollover, continue primarily from your notes, the recent conversation,
-  and live repository state. Do not reconstruct the previous context from
-  history; use history only to recover a specific missing detail.
-- get_context_remaining is a tool you invoke with no arguments; it returns the
-  measured numbers. When you need to know how much context is left — or when
-  you are asked about it — call it and report the numbers it returned. The
-  current context state is not readable from repository files, from the plugin
-  source, or from memory: only that tool reports it, and claiming a reading you
-  did not receive is a fabrication even when the guess sounds plausible.
-- A reminder near the automatic rollover point appears at most once per window.
-`.trim()
+// Exact approved Codex adaptations; provenance and golden fixtures in tests/prompts.
+export const CONTEXT_MANAGEMENT_GUIDANCE =
+  'For tasks that may span context windows, use `notes` to maintain a concise checkpoint of the goal, decisions, progress, learnings and next steps. Include the window ID and item ID for every relevant user request you are currently solving as well as important actions/tool calls. You can use `history` tool to look up details with the references later. Use the window and item IDs in <context_references>; entries identify persisted user messages, assistant tool calls, and tool results. Newly admitted messages appear in the next reference snapshot. Before saving a checkpoint, use `get_context_remaining` to obtain current references when needed. Pass returned IDs unchanged. Note paths are relative to the current Agent session. Reads and writes are limited to this session; absolute and cross-agent paths are unsupported.\n\nIt is a good idea to take incremental notes while you work so that you do not miss any important info. You can also use `get_context_remaining` tool to find the remaining token budget for better planning. Once the token budget is exhausted, you will lose access to the current window and continue in a fresh context window and you can only recover through `notes` and `history` tools. So be careful not to over-run the context window without any documentation.\n\nIf Previous context window id is present in `<context_window>`, it means a context reset occurred and this is a new window. After a reset, read the checkpoint and use the read-only `history` tool to recover any missing details. When a window ID and item ID are known, prefer `history` with action `read` directly; when they are missing or uncertain, use action `list_items` or `search` to locate the item first.\n\nTreat notes and history as internal bookkeeping. Do not mention them in user-facing messages.\n'
+export const REMINDER_TEMPLATE =
+  '<context_window_reminder>\nYour current context window is nearly exhausted; only {n_remaining} tokens remain. Before starting a new context window, save concise progress notes with the `notes` tool with the goal, decisions, progress, learnings, next steps, and the window ID and item ID of every relevant user request still being solved, as well as important actions/tool calls for future reference. Use the window and item IDs in <context_references>; entries identify persisted user messages, assistant tool calls, and tool results. Newly admitted messages appear in the next reference snapshot. Before saving a checkpoint, use `get_context_remaining` to obtain current references when needed. Pass returned IDs unchanged. You should write or append notes in a way to best help you recover in a new context window. It is also a good idea to clean up your old notes if they become obsolete or irrelevant. Future context windows will not automatically include the current conversation. After saving your state, call `new_context` to continue in a fresh context window.\n</context_window_reminder>'
+export const FALLBACK_PROMPT =
+  '<context_window_reminder>\nThe current context window is exhausted. Do not continue the task or give a final answer in this window. The next window will not automatically include this conversation. Make exactly one write or append call to `notes` now to save a concise checkpoint with the goal, decisions, progress, learnings, next steps, and the window ID and item ID of every relevant user request still being solved, as well as important actions/tool calls for future reference. Use the window and item IDs in the attached <context_references> snapshot, which includes the latest committed task inputs and tool results. Pass returned IDs unchanged; do not make an additional reference lookup in this window. After the notes result returns, call `new_context`; do not use any tools other than `notes` and `new_context`.\n</context_window_reminder>'
+export const HISTORY_DESCRIPTION =
+  'Recover prior conversation after a context-window reset by listing, reading, and searching normalized history using the opaque window and item IDs returned by this tool. Pass returned IDs unchanged when filtering or reading an item. Items are ordered by persisted ordinal, then creation time; list and search calls return no matches for an unknown window. Calls are limited to the current Agent session and items outside the active context. History is read-only; committed archived items are immediately queryable. Use action list_windows, list_items, search, or read. This is private model-only state. Use it silently to continue the task. Never disclose or describe the tool, its existence or use, paths, storage or recovery mechanisms, or the private contents (including by quoting or summarizing them) to the user.'
+export const NOTES_DESCRIPTION =
+  "Read and maintain private notes that survive context-window transitions within this rollout. Paths are virtual, not filesystem paths. Paths are relative to the current Agent session. Absolute and cross-agent paths are unsupported. Use action list, read, search, write, or append. File operations require <path>; path-prefix arguments may be omitted to use the current notes directory. Empty, '.', and '..' path components are unsupported. Shell expansion is not performed, so '~' is treated literally. Successful writes are immediately visible to reads, listings, and searches. Every file must remain at or below 1,000,000 UTF-8 bytes; create another file before approaching the limit. This is private model-only state. Use it silently to continue the task. Never disclose or describe the tool, its existence or use, paths, storage or recovery mechanisms, or the private contents (including by quoting or summarizing them) to the user."

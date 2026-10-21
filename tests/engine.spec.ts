@@ -1,109 +1,104 @@
-/**
- * Engine integration tests over the real agent loop: model-requested rollover
- * through the `new_context` tool, notes/handoff carry-over, one-per-window
- * pressure reminders, and manual rollover behind the compaction command.
- *
- * @module tests/engine.spec
- */
-
-import { describe, expect, it } from 'vitest'
+import { expect, it } from 'vitest'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { countRollovers } from '../src/rollover.ts'
 import { NotesStore } from '../src/notes.ts'
+import { currentWindow, collectHistory } from '../src/history.ts'
 import {
-  derivedTexts,
   engineHarness,
   followup,
   newContextCall,
-  reminderTexts,
   ScriptedAdapter,
-  seedExchanges,
   textResponse,
-  usageResponse,
+  toolCall,
 } from './harness.ts'
 
-describe('ContextRolloverEngine', () => {
-  it('rolls over when the model calls new_context mid-turn and continues from notes + tail', async () => {
-    const { ctx, agent, session, notesBase } = await engineHarness('model-requested')
-
-    // Seed durable notes as if the model had saved its research.
-    const store = new NotesStore(NotesStore.directoryFor(session.id, notesBase))
-    await store.write('state.md', 'goal: prove model-driven rollover\nnext: implement')
-
-    const adapter = new ScriptedAdapter([
-      ...Array.from({ length: 20 }, (_unused, index) => textResponse(`finding ${index} details`)),
-      newContextCall('{"handoff":"Implement the notes next steps."}'),
-      textResponse('implementing now'),
-    ])
-    ctx.llm.registerAdapter(['mock'], adapter)
-
-    await seedExchanges(agent, 20)
-    await followup(agent, 'Research is done; roll over and implement.')
-
-    // The rollover committed exactly once and the fresh window carries the
-    // notes and the handoff.
-    expect(countRollovers(session)).toBe(1)
-    const texts = derivedTexts(session).join('\n')
-    expect(texts).toContain('<context-rollover checkpoint>')
-    expect(texts).toContain('prove model-driven rollover')
-    expect(texts).toContain('Implement the notes next steps.')
-    expect(texts).toContain('reason: model-requested')
-    // The new_context tool result stayed in the recent tail, next to the
-    // post-rollover answer.
-    const tailResultSeq = session.surface.nodes
-      .map(seq => session.eventAt(seq))
-      .filter(event => event?.type === 'tool/result')
-      .map(event => event?.seq)
-      .pop()
-    const tailResult = tailResultSeq === undefined ? undefined : session.eventAt(tailResultSeq)
-    expect(JSON.stringify(tailResult?.data)).toContain('A new context window will start')
-    // The assistant's post-rollover answer arrived on the fresh window.
-    expect(texts).toContain('implementing now')
+it('rebuilds effective runtime state and drops the old snapshot, all tail and note bodies in the first new request', async () => {
+  const { ctx, agent, session } = await engineHarness('native-window')
+  const note = new NotesStore(NotesStore.directoryFor(agent.id, session.id))
+  await note.write('state.md', 'PRIVATE_NOTE_BODY')
+  let mode = 'approval-required'
+  ctx.systemPrompt.context({
+    name: 'effective-policy',
+    order: 10,
+    text: () => `POLICY:${mode}`,
   })
-
-  it('delivers the pressure reminder at most once per window', async () => {
-    const { ctx, agent, session } = await engineHarness('reminder', {
-      thresholdRatio: 0.5,
-      reminderThresholdRatio: 0.01,
-    })
-    const adapter = new ScriptedAdapter([
-      usageResponse('answer 1', 5000),
-      usageResponse('answer 2', 6000),
-    ])
-    ctx.llm.registerAdapter(['mock'], adapter)
-
-    await followup(agent, 'turn one')
-    await followup(agent, 'turn two')
-
-    // The first post-usage pre-step crossed the 1% threshold and reminded
-    // once; the second turn must not repeat it (same window, no rollover).
-    const reminders = reminderTexts(session)
-    expect(reminders).toHaveLength(1)
-    expect(reminders[0]).toContain('automatic rollover')
-    expect(countRollovers(session)).toBe(0)
+  const adapter = new ScriptedAdapter([
+    textResponse('OLD_ASSISTANT ' + 'evidence '.repeat(1000)),
+    newContextCall('{}'),
+    textResponse('continued'),
+  ])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'OLD_USER')
+  mode = 'approval-current'
+  let steered = false
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    if (!steered && exec.name === 'new_context') {
+      steered = true
+      agent.steer(
+        createUserMessage({
+          content: [{ type: 'text', text: 'NEW_INPUT_MUST_SURVIVE' }],
+          source: { kind: 'user' },
+        }),
+      )
+    }
+    return next()
   })
+  await followup(agent, 'request a reset')
+  expect(countRollovers(session)).toBe(1)
+  const request = JSON.stringify(
+    adapter.requests.at(-1)!.filter((m) => m.role !== 'system'),
+  )
+  expect(request).toContain(
+    `Current context window id: ${currentWindow(session).window_id}`,
+  )
+  expect(request).not.toContain(
+    `Current context window id: ${session.id}:initial`,
+  )
+  expect(request).toContain('POLICY:approval-current')
+  expect(request).toContain('NEW_INPUT_MUST_SURVIVE')
+  expect(request).toContain('<context_references>')
+  expect(request).toContain('state.md')
+  expect(request).not.toContain('PRIVATE_NOTE_BODY')
+  expect(request).not.toContain('OLD_ASSISTANT')
+  expect(request).not.toContain('OLD_USER')
+  expect(adapter.requests).toHaveLength(3)
+  expect(
+    collectHistory(session).some((i) => i.content.includes('OLD_USER')),
+  ).toBe(true)
+})
 
-  it('performs a manual rollover via compactNow on an idle agent', async () => {
-    const { ctx, engine, agent, session } = await engineHarness('manual')
-    const adapter = new ScriptedAdapter(
-      Array.from({ length: 20 }, (_unused, index) => textResponse(`investigation step ${index} result`)),
-    )
-    ctx.llm.registerAdapter(['mock'], adapter)
-
-    await seedExchanges(agent, 20)
-    await followup(agent, 'investigate the thing')
-
-    const compacted = await engine.compactNow(agent, new AbortController().signal)
-    expect(compacted).not.toBeNull()
-    expect(countRollovers(session)).toBe(1)
-    // Manual rollover carries only notes plus the retained verbatim tail.
-    const texts = derivedTexts(session).join('\n')
-    expect(texts).not.toContain('Recovery record')
-    expect(texts).toContain('investigate the thing')
-  })
-
-  it('mounts the context-management guidance section', async () => {
-    const { ctx } = await engineHarness('guidance')
-    const assembled = await ctx.systemPrompt.assemble({})
-    expect(assembled.sections.some(section => section.text.includes('temporary working memory'))).toBe(true)
-  })
+it('continues three useful windows in one turn without an LLM summary request', async () => {
+  const { ctx, agent, session } = await engineHarness('three-windows')
+  ctx.tools.register(
+    defineTool({
+      name: 'material',
+      description: 'read material',
+      parameters: {},
+      output: {
+        schema: { type: 'json' },
+        render: () => [{ type: 'text', text: 'large evidence '.repeat(1200) }],
+      },
+      execute: async () => ({ ok: true }),
+    }),
+  )
+  const adapter = new ScriptedAdapter([
+    toolCall('material', '{}', 'm1'),
+    newContextCall('{}', 'n1'),
+    toolCall('material', '{}', 'm2'),
+    newContextCall('{}', 'n2'),
+    toolCall('material', '{}', 'm3'),
+    newContextCall('{}', 'n3'),
+    textResponse('finished'),
+  ])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'Complete the task across windows')
+  expect(countRollovers(session)).toBe(3)
+  expect(adapter.requests).toHaveLength(7)
+  expect(JSON.stringify(adapter.requests.at(-1))).not.toContain(
+    'large evidence',
+  )
+  expect(
+    session.snapshotEvents().filter((e) => e.type === 'turn/start'),
+  ).toHaveLength(1)
 })

@@ -1,10 +1,8 @@
 name: ci
-
 on:
   push:
     branches: [main]
   pull_request:
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,37 +10,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 11.5.2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # The generators resolve DSH sources through the sibling checkout;
-      # CI checks out the harness fork into the workspace and points
-      # DSH_CHECKOUT_DIR at it.
-      - uses: actions/checkout@v4
-        with:
-          repository: athif23/deepseek-harness
-          path: deepseek-harness
-      # The generators and tests resolve DSH through the sibling checkout:
-      # its dependencies and built lib/types must exist, exactly like local
-      # development.
-      - name: Build the DSH checkout
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm run build
-        working-directory: deepseek-harness
       - run: pnpm typecheck
-        env:
-          DSH_CHECKOUT_DIR: ./deepseek-harness
       - run: pnpm test
-        env:
-          DSH_CHECKOUT_DIR: ./deepseek-harness
       - run: pnpm build
-        env:
-          DSH_CHECKOUT_DIR: ./deepseek-harness
-      - name: Compat typecheck against the newest public dsh packages
-        run: |
-          pnpm compat:install
-          pnpm typecheck:compat
+      - run: pnpm pack

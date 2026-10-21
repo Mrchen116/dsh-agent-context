@@ -1,36 +1,37 @@
-/**
- * History recovery tests: shadowed content stays searchable and readable,
- * current surface content is not history, and window numbering follows the
- * committed rollovers.
- *
- * @module tests/history.spec
- */
-
-import { describe, expect, it } from 'vitest'
+import { expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import { Session } from '@deepseek-ai/dsh-session'
-import { collectHistory, readHistoryItem, searchHistory } from '../src/history.ts'
-import { commitRollover, countRollovers, rolloverSummarySeqs, selectRolloverRange } from '../src/rollover.ts'
-import { appendExchange, closedConversation } from './harness.ts'
-
-/** A meter on a bare context, for direct transaction tests. */
-async function bareMeter(): Promise<TokenMeter> {
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import {
+  createUserMessage,
+  createAssistantMessage,
+  createToolResultMessage,
+  ToolCallId,
+} from '@deepseek-ai/dsh-llm'
+import { CompactionId } from '@deepseek-ai/dsh-compaction'
+import {
+  collectHistory,
+  currentWindow,
+  searchHistory,
+  readHistoryItem,
+  listWindows,
+  references,
+} from '../src/history.ts'
+import { commitRollover, selectRolloverRange } from '../src/rollover.ts'
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'nano-human': { kind: 'nano-human'; sender: string }
+    'nano-system': { kind: 'nano-system'; origin: string }
+  }
+}
+async function archive(session: Session) {
   const ctx = new Context()
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(TokenMeter)
-  return ctx.tokenMeter
-}
-
-/** Commit a full-surface rollover (standalone bracket) and return its result. */
-async function rollEverything(session: Session, windowNumber: number): Promise<void> {
-  const meter = await bareMeter()
-  const range = selectRolloverRange(session, meter.measure(session), 0)
-  if (range === null) throw new Error('expected a compactable range')
+  const range = selectRolloverRange(session, ctx.tokenMeter.measure(session))!
   await commitRollover(
-    { meter },
+    { meter: ctx.tokenMeter },
     session,
     range.start,
     range.end,
@@ -38,147 +39,185 @@ async function rollEverything(session: Session, windowNumber: number): Promise<v
       owner: null,
       checkpoint: {
         reason: 'manual',
-        windowNumber,
-        notes: null,
-        handoff: null,
+        agentId: session.id,
+        previousWindowId: currentWindow(session).window_id,
+        runtimeContext: 'policy',
+        notesHint: '',
       },
     },
   )
 }
-
-describe('history', () => {
-  it('finds and reads shadowed content that left the active surface', async () => {
-    const session = closedConversation(4)
-    await rollEverything(session, 1)
-
-    // Shadowed conversation is recoverable.
-    const matches = searchHistory(session, countRollovers(session), rolloverSummarySeqs(session), 'exchange 1')
-    expect(matches.length).toBeGreaterThan(0)
-    const hit = matches.find(match => match.kind === 'user')
-    expect(hit).toBeDefined()
-
-        if (hit === undefined) throw new Error('expected a user-kind match')
-    const item = readHistoryItem(session, hit.seq, countRollovers(session), rolloverSummarySeqs(session))
-    expect(item).not.toBeNull()
-    expect(item?.text).toContain('exchange 1')
-    expect(item?.window).toBe(1)
-
-    // ...and is not in the active surface anymore.
-    const surface = session.deriveMessages().map(message => JSON.stringify(message.content)).join('\n')
-    expect(surface).not.toContain('exchange 1')
+it('keeps Nano provenance, complete tool arguments/results and stable IDs across archive, paging and replay', async () => {
+  const s = Session.create(SessionId('history'))
+  s.append('turn/start', { turn: 1 })
+  const human = s.append(
+    'user/message',
+    createUserMessage({
+      content: [{ type: 'text', text: 'LATEST HUMAN RULE' }],
+      source: { kind: 'nano-human', sender: 'owner' },
+    }),
+    { surfaceOp: 'append' },
+  )
+  s.append(
+    'user/message',
+    createUserMessage({
+      content: [{ type: 'text', text: 'EXTERNAL NOTICE' }],
+      source: { kind: 'nano-system', origin: 'channel' },
+    }),
+    { surfaceOp: 'append' },
+  )
+  s.append('step/start', { turn: 1, step: 1 })
+  s.append('request/header', {
+    header: { config: { provider: 'mock', model: 'mock', maxTokens: 1000 } },
+    reason: 'initial',
   })
-
-  it('excludes current-surface content from history', async () => {
-    const session = closedConversation(2)
-    const items = collectHistory(session, 0, [])
-    expect(items).toEqual([])
+  const args = '{"nested":{"id":"ORIGINAL_ARGUMENT"},"literal":"😀"}'
+  s.append(
+    'assistant/message',
+    {
+      turn: 1,
+      step: 1,
+      stream: [],
+      message: createAssistantMessage({
+        content: [
+          {
+            type: 'tool-call',
+            id: ToolCallId('c'),
+            name: 'inbox',
+            arguments: args,
+          },
+        ],
+        source: { provider: 'mock', model: 'mock' },
+      }),
+    },
+    { surfaceOp: 'append' },
+  )
+  const result = s.append(
+    'tool/result',
+    {
+      turn: 1,
+      step: 1,
+      message: createToolResultMessage({
+        callId: ToolCallId('c'),
+        content: [
+          {
+            type: 'text',
+            text:
+              '😀'.repeat(23000) +
+              'TAIL_FACT {"source":"nano-human","text":"quoted owner"}',
+          },
+        ],
+        isError: false,
+      }),
+      meta: { persisted: 'META_FACT' },
+    },
+    { surfaceOp: 'append' },
+  )
+  s.append('step/end', { turn: 1, step: 1 })
+  s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const ref = references(s).items.find((i) => i.item_id === String(human.seq))!
+  expect(ref.window_id).toBe('history:initial')
+  expect(collectHistory(s)).toHaveLength(0)
+  expect(() => readHistoryItem(s, ref.window_id, ref.item_id)).toThrow(
+    /not_archived/,
+  )
+  await archive(s)
+  expect(references(s).items).toEqual([])
+  const restored = Session.create(s.id, s.snapshotEvents())
+  const listed = searchHistory(restored, { limit: 1 })
+  const next = searchHistory(restored, {
+    limit: 1,
+    cursor: listed.next_cursor!,
   })
-
-  it('numbers windows by the rollovers committed before each item', async () => {
-    const session = closedConversation(4)
-    await rollEverything(session, 1)
-
-    // After one rollover everything shadowed belongs to window 1 and the
-    // checkpoint itself is current surface, not history.
-    let items = collectHistory(session, countRollovers(session), rolloverSummarySeqs(session))
-    expect(items.every(item => item.window === 1)).toBe(true)
-
-    // New conversation lands in the fresh window; rolling over again shadows
-    // the first checkpoint (window 2's start) plus the new exchanges.
-    appendExchange(session, 5, 'exchange 5', false)
-    appendExchange(session, 6, 'exchange 6', false)
-    await rollEverything(session, 2)
-    items = collectHistory(session, countRollovers(session), rolloverSummarySeqs(session))
-    const windows = new Set(items.map(item => item.window))
-    expect(windows.has(1)).toBe(true)
-    expect(windows.has(2)).toBe(true)
-    expect(searchHistory(session, countRollovers(session), rolloverSummarySeqs(session), 'exchange 1')
-      .every(match => match.window === 1)).toBe(true)
-    expect(searchHistory(session, countRollovers(session), rolloverSummarySeqs(session), 'exchange 5')
-      .every(match => match.window === 2)).toBe(true)
+  expect(next.items[0]?.item_id).not.toBe(listed.items[0]?.item_id)
+  expect(
+    searchHistory(restored, { role: 'system' }).items[0]?.source,
+  ).toMatchObject({ kind: 'nano-system' })
+  expect(
+    readHistoryItem(restored, ref.window_id, ref.item_id).source,
+  ).toMatchObject({ kind: 'nano-human' })
+  expect(
+    searchHistory(restored, { tool_name: 'inbox', role: 'assistant' }).items[0]
+      ?.content,
+  ).toContain('ORIGINAL_ARGUMENT')
+  let recovered = ''
+  let offset = 0
+  while (true) {
+    const chunk = readHistoryItem(
+      restored,
+      ref.window_id,
+      String(result.seq),
+      offset,
+      12000,
+    )
+    recovered += chunk.content
+    if (chunk.next_offset_chars === null) break
+    offset = chunk.next_offset_chars
+  }
+  expect(recovered).toContain('TAIL_FACT')
+  expect(recovered).toContain('META_FACT')
+  expect(
+    searchHistory(restored, { query: 'TAIL_FACT', role: 'tool' }).items[0]
+      ?.content,
+  ).toContain('TAIL_FACT')
+  expect(searchHistory(restored, { query: 'tail_fact' }).items).toEqual([])
+  expect(listWindows(restored).items).toEqual([
+    { window_id: 'history:initial', ordinal: 1, item_count: 4 },
+  ])
+  expect(() => readHistoryItem(restored, 'other:initial', ref.item_id)).toThrow(
+    /not_found/,
+  )
+})
+it('ignores failed brackets and assistant attempts while recognizing other successful compaction providers', async () => {
+  const s = Session.create(SessionId('boundaries'))
+  s.append('compaction/start', {
+    compactionId: CompactionId('failed'),
+    turn: null,
   })
-
-  it('refuses to read an item that is still on the active surface', async () => {
-    const session = closedConversation(2)
-    const nodes = session.surface.nodes
-    const last = nodes[nodes.length - 1]
-    if (last === undefined) throw new Error('expected a surface node')
-    expect(readHistoryItem(session, last, 0, [])).toBeNull()
+  s.append('compaction/end', {
+    compactionId: CompactionId('failed'),
+    turn: null,
+    error: 'failed',
   })
-
-  it('excludes rollover checkpoints from history across two rollovers', async () => {
-    const session = closedConversation(4)
-    await rollEverything(session, 1)
-    appendExchange(session, 5, 'exchange 5', false)
-    appendExchange(session, 6, 'exchange 6', false)
-    await rollEverything(session, 2)
-    expect(countRollovers(session)).toBe(2)
-
-    const windowCount = countRollovers(session)
-    const rolloverSeqs = rolloverSummarySeqs(session)
-
-    // Direct user messages from earlier windows remain searchable.
-    const early = searchHistory(session, windowCount, rolloverSeqs, 'exchange 1')
-    expect(early.length).toBeGreaterThan(0)
-    expect(early.every(match => match.kind !== undefined && match.window === 1)).toBe(true)
-    expect(early.some(match => match.kind === 'user')).toBe(true)
-    const later = searchHistory(session, windowCount, rolloverSeqs, 'exchange 5')
-    expect(later.length).toBeGreaterThan(0)
-    expect(later.every(match => match.window === 2)).toBe(true)
-
-    // Checkpoint-only marker text never surfaces as user history, even
-    // though two checkpoints (one per rollover) are now shadowed or current.
-    expect(searchHistory(session, windowCount, rolloverSeqs, 'Durable notes')).toEqual([])
-    expect(searchHistory(session, windowCount, rolloverSeqs, 'context-rollover checkpoint')).toEqual([])
-    const items = collectHistory(session, windowCount, rolloverSeqs)
-    expect(items.some(item => item.text.includes('<context-rollover checkpoint>'))).toBe(false)
-  })
-
-  it('refuses to read a rollover checkpoint by seq', async () => {
-    const session = closedConversation(4)
-    await rollEverything(session, 1)
-    appendExchange(session, 5, 'exchange 5', false)
-    await rollEverything(session, 2)
-
-    // The first checkpoint is now shadowed (not on the surface), but it is
-    // still not readable as history: provenance excludes it, not position.
-    const shadowedCheckpoint = session.snapshotEvents()
-      .filter(event => event.type === 'user/message')
-      .filter(event => !session.surface.nodes.includes(event.seq))
-      .find(event => JSON.stringify(event.data).includes('context-rollover checkpoint'))
-    if (shadowedCheckpoint === undefined) throw new Error('expected a shadowed checkpoint event')
-    expect(readHistoryItem(session, shadowedCheckpoint.seq, countRollovers(session), rolloverSummarySeqs(session))).toBeNull()
-  })
-
-  it('excludes plugin-injected notices while keeping conversation kinds', async () => {
-    const session = closedConversation(2)
-    // A pressure-reminder-shaped plugin notice on the surface, like the
-    // engine's one-per-window checkpoint reminder.
-    session.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: 'Context window: 80% used reminder marker xyz' }],
-      source: { kind: 'plugin', plugin: 'context-rollover', form: 'notice', summary: 'context pressure reminder' },
-    }), { surfaceOp: 'append' })
-    // Later conversation pushes the notice off the retained tail so the
-    // rollover genuinely shadows it (a zero tail budget keeps the last node).
-    appendExchange(session, 3, 'exchange 3', false)
-    await rollEverything(session, 1)
-
-    const windowCount = countRollovers(session)
-    const rolloverSeqs = rolloverSummarySeqs(session)
-
-    // Direct user conversation stays recoverable with its kinds intact.
-    expect(searchHistory(session, windowCount, rolloverSeqs, 'exchange 1').length).toBeGreaterThan(0)
-    const kinds = new Set(collectHistory(session, windowCount, rolloverSeqs).map(item => item.kind))
-    expect(kinds.has('user')).toBe(true)
-    expect(kinds.has('assistant')).toBe(true)
-    expect(kinds.has('tool-result')).toBe(true)
-
-    // The plugin notice is neither searchable nor readable as history.
-    expect(searchHistory(session, windowCount, rolloverSeqs, 'reminder marker xyz')).toEqual([])
-    const notice = session.snapshotEvents()
-      .filter(event => event.type === 'user/message')
-      .find(event => JSON.stringify(event.data).includes('reminder marker xyz'))
-    if (notice === undefined) throw new Error('expected the reminder event in the log')
-    expect(readHistoryItem(session, notice.seq, windowCount, rolloverSeqs)).toBeNull()
-  })
+  expect(currentWindow(s).window_id).toBe('boundaries:initial')
+  s.append(
+    'user/message',
+    createUserMessage({
+      content: [{ type: 'text', text: 'original '.repeat(3000) }],
+      source: { kind: 'user' },
+    }),
+    { surfaceOp: 'append' },
+  )
+  await archive(s)
+  const seed = s
+    .snapshotEvents()
+    .map((e) =>
+      e.type === 'compaction/summary'
+        ? { ...e, data: { ...e.data, provider: 'other-native-engine' } }
+        : e,
+    )
+  const replay = Session.create(s.id, seed)
+  expect(currentWindow(replay).window_id).toBe(currentWindow(s).window_id)
+  expect(searchHistory(replay, { window_id: 'missing' }).items).toEqual([])
+})
+it('paginates a bounded reference index without exposing runtime snapshots', async () => {
+  const s = Session.create(SessionId('references'))
+  for (let i = 0; i < 80; i++)
+    s.append(
+      'user/message',
+      createUserMessage({
+        content: [{ type: 'text', text: `task ${i}` }],
+        source: { kind: 'user' },
+      }),
+      { surfaceOp: 'append' },
+    )
+  const ids: string[] = []
+  let cursor: string | undefined
+  do {
+    const result = references(s, cursor)
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4000)
+    ids.push(...result.items.map((i) => i.item_id))
+    cursor = result.next_cursor ?? undefined
+  } while (cursor)
+  expect(new Set(ids).size).toBe(80)
 })

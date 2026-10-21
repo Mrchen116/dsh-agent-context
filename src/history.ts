@@ -1,221 +1,299 @@
-/**
- * History: targeted read-only recovery of conversation that left the active
- * surface. The DSH session log is the only transcript store — history items
- * are the log's shadowed surface events, recovered by literal search and
- * bounded reads, never reloaded wholesale.
- *
- * @module dsh-context-rollover/history
- */
-
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { Seq } from './compat.ts'
-import { sessionEventAt, sessionEvents } from './compat.ts'
-
-/** Which kind of surface event one history item came from. */
-export type HistoryItemKind = 'user' | 'assistant' | 'tool-result'
-
-/** One recoverable history item. */
+import { boundedInteger } from './notes.ts'
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
+export interface WindowInfo {
+  window_id: string
+  ordinal: number
+  start_seq: number
+  end_seq: number
+}
 export interface HistoryItem {
-  readonly seq: number
-  readonly kind: HistoryItemKind
-  /** 1-based number of the rollover that shadowed this item (1 = the first window). */
-  readonly window: number
-  /** The item's text content (joined text blocks). */
-  readonly text: string
+  window_id: string
+  item_id: string
+  ordinal: number
+  seq: number
+  event_type: string
+  role: 'user' | 'assistant' | 'tool' | 'system'
+  source: { [key: string]: Json } | null
+  tool_names: string[]
+  content: string
 }
-
-/** One literal search hit over history. */
-export interface HistoryMatch {
-  readonly seq: number
-  readonly kind: HistoryItemKind
-  readonly window: number
-  /** 1-based character offset of the match in the item text. */
-  readonly offset: number
-  /** The item text around the match, bounded for model consumption. */
-  readonly snippet: string
+export interface HistoryQuery {
+  window_id?: string
+  role?: string
+  tool_name?: string
+  query?: string
+  limit?: number
+  cursor?: string
+  recent_first?: boolean
+  max_chars_per_item?: number
 }
-
-/** Extract an item's text content from its message blocks. */
-function messageBlocksText(blocks: readonly { type: string; text?: string }[]): string {
-  return blocks
-    .map(block => block.type === 'text' ? block.text : `[${block.type}]`)
-    .filter((text): text is string => text !== undefined)
-    .join('\n')
-}
-
-/**
- * Extract recoverable text from a shadowed `user/message` event, or `null`
- * when the event is not direct user-authored conversation. DSH message
- * provenance is the discriminator: only `source.kind === 'user'` qualifies.
- * Plugin-injected contexts — rollover checkpoints (`plugin/compact`), pressure
- * reminders, and any other injected notice — are excluded so `kind: 'user'`
- * always means an actual direct user message.
- * @param event - a `user/message` log event.
- * @returns the message text, or `null` when the event is plugin-generated.
- */
-function directUserText(event: Extract<SessionEvent, { type: 'user/message' }>): string | null {
-  if (event.data.source.kind !== 'user') return null
-  return messageBlocksText(event.data.content)
-}
-
-/**
- * Attribute one shadowed event to its originating window: the number of
- * rollovers committed at or after the item's seq.
- * @param seq - the shadowed event's log position.
- * @param windowCount - number of rollovers committed so far.
- * @param rolloverSeqs - seqs of the rollover summary events, ascending.
- * @returns the 1-based window number the item belongs to.
- */
-function windowForSeq(seq: number, windowCount: number, rolloverSeqs: readonly Seq[]): number {
-  for (const rolloverSeq of rolloverSeqs) {
-    if (rolloverSeq >= seq) {
-      return rolloverSeqs.indexOf(rolloverSeq) + 1
+/** Successful native compaction brackets define windows, regardless of compaction provider. */
+export function windows(session: Session): WindowInfo[] {
+  const result: WindowInfo[] = [
+    {
+      window_id: `${session.id}:initial`,
+      ordinal: 1,
+      start_seq: -1,
+      end_seq: -1,
+    },
+  ]
+  const starts = new Map<string, number>()
+  const summaries = new Set<string>()
+  for (const event of session.snapshotEvents()) {
+    if (event.type === 'compaction/start')
+      starts.set(event.data.compactionId, event.seq)
+    if (event.type === 'compaction/summary')
+      summaries.add(event.data.compactionId)
+    if (
+      event.type === 'compaction/end' &&
+      event.data.error === undefined &&
+      summaries.has(event.data.compactionId)
+    ) {
+      const seq = starts.get(event.data.compactionId)
+      if (seq !== undefined)
+        result.push({
+          window_id: `${session.id}:${seq}`,
+          ordinal: result.length + 1,
+          start_seq: seq,
+          end_seq: event.seq,
+        })
     }
   }
-  return windowCount + 1
+  return result
 }
-
-/**
- * Collect every item that has left the active surface, in log order. Current
- * surface content is active context, not history.
- * @param session - session whose log supplies the history.
- * @param windowCount - number of rollovers committed so far (window numbering).
- * @param rolloverSeqs - seqs of the rollover summary events, ascending.
- * @returns the shadowed items, oldest first.
- */
-export function collectHistory(
-  session: Session,
-  windowCount: number,
-  rolloverSeqs: readonly Seq[],
-): HistoryItem[] {
-  const surface = new Set(session.surface.nodes)
+/** Current persisted window identity, also valid after session restoration. */
+export function currentWindow(session: Session): WindowInfo {
+  return windows(session).at(-1)!
+}
+function excluded(event: SessionEvent): boolean {
+  if (event.type !== 'user/message') return false
+  const source = event.data.source
+  return (
+    (source.kind as string) === 'runtime-context' ||
+    source.kind === 'compact-checkpoint' ||
+    (source.kind as string) === 'agent-context'
+  )
+}
+/** Normalize the persisted message payload losslessly; provenance stays in its original role. */
+export function normalizedItems(session: Session): HistoryItem[] {
+  const boundaries = windows(session)
+  const calls = new Map<string, string>()
   const items: HistoryItem[] = []
-  for (const event of sessionEvents(session)) {
-    if (surface.has(event.seq)) continue
-    let kind: HistoryItemKind
-    let text: string
-    switch (event.type) {
-      case 'user/message': {
-        const direct = directUserText(event)
-        if (direct === null) continue
-        kind = 'user'
-        text = direct
-        break
+  for (const event of session.snapshotEvents()) {
+    if (excluded(event)) continue
+    const message =
+      event.type === 'user/message'
+        ? event.data
+        : event.type === 'assistant/message' || event.type === 'tool/result'
+          ? event.data.message
+          : undefined
+    if (message === undefined) continue
+    let role: HistoryItem['role'] =
+      event.type === 'assistant/message'
+        ? 'assistant'
+        : event.type === 'tool/result'
+          ? 'tool'
+          : 'user'
+    if (
+      event.type === 'user/message' &&
+      !['user', 'nano-human'].includes(event.data.source.kind)
+    )
+      role = 'system'
+    const names: string[] = []
+    for (const block of message.content)
+      if (block.type === 'tool-call') {
+        calls.set(block.id, block.name)
+        names.push(block.name)
       }
-      case 'assistant/message':
-        kind = 'assistant'
-        text = messageBlocksText(event.data.message.content)
-        break
-      case 'tool/result':
-        kind = 'tool-result'
-        text = messageBlocksText(event.data.message.content)
-        break
-      default:
-        continue
+    if (message.role === 'tool') {
+      const name = calls.get(message.toolCallId)
+      if (name) names.push(name)
     }
-    if (text.length === 0) continue
-    items.push({ seq: event.seq as Seq, kind, window: windowForSeq(event.seq, windowCount, rolloverSeqs), text })
+    const window =
+      boundaries.findLast((w) => event.seq > w.end_seq) ?? boundaries[0]!
+    // JSON preserves complete calls, arguments, result payloads and attachment metadata.
+    // Text blocks additionally retain readable newlines for bounded recovery.
+    const blocks = message.content
+      .map((block) =>
+        block.type === 'text' ? block.text : JSON.stringify(block),
+      )
+      .join('\n')
+    const content =
+      event.type === 'tool/result'
+        ? `${blocks}\n${JSON.stringify({ ...event.data, message: { ...event.data.message, content: undefined } })}`
+        : blocks
+    items.push({
+      window_id: window.window_id,
+      item_id: String(event.seq),
+      ordinal: window.ordinal,
+      seq: event.seq,
+      event_type: event.type,
+      role,
+      source: JSON.parse(JSON.stringify(message.source)) as {
+        [key: string]: Json
+      },
+      tool_names: names,
+      content,
+    })
   }
   return items
 }
-
-/** Render a bounded snippet around one match. */
-function snippetAround(text: string, offset: number, matchLength: number): string {
-  const radius = 160
-  const start = Math.max(0, offset - radius)
-  const end = Math.min(text.length, offset + matchLength + radius)
-  const prefix = start > 0 ? '…' : ''
-  const suffix = end < text.length ? '…' : ''
-  return `${prefix}${text.slice(start, end)}${suffix}`
+/** Archived messages only; active message bodies never leak through History. */
+export function collectHistory(session: Session): HistoryItem[] {
+  const active = new Set<number>(session.surface.nodes)
+  return normalizedItems(session).filter((item) => !active.has(item.seq))
 }
-
-/**
- * Literal case-insensitive search over history items.
- * @param session - session whose log supplies the history.
- * @param windowCount - number of rollovers committed so far.
- * @param rolloverSeqs - seqs of the rollover summary events, ascending.
- * @param query - literal substring to find.
- * @param maxMatches - upper bound on returned matches.
- * @returns the matches in log order.
- */
-export function searchHistory(
-  session: Session,
-  windowCount: number,
-  rolloverSeqs: readonly Seq[],
-  query: string,
-  maxMatches = 10,
-): HistoryMatch[] {
-  const lowerQuery = query.toLowerCase()
-  if (lowerQuery.length === 0) return []
-  const matches: HistoryMatch[] = []
-  for (const item of collectHistory(session, windowCount, rolloverSeqs)) {
-    const lowerText = item.text.toLowerCase()
-    let offset = lowerText.indexOf(lowerQuery)
-    while (offset !== -1) {
-      matches.push({
-        seq: item.seq,
-        kind: item.kind,
-        window: item.window,
-        offset,
-        snippet: snippetAround(item.text, offset, lowerQuery.length),
-      })
-      if (matches.length >= maxMatches) return matches
-      offset = lowerText.indexOf(lowerQuery, offset + lowerQuery.length)
-    }
+function slicePage<T extends { seq: number }>(items: T[], query: HistoryQuery) {
+  const recent = query.recent_first ?? true
+  let sorted = [...items].sort((a, b) =>
+    recent ? b.seq - a.seq : a.seq - b.seq,
+  )
+  if (query.cursor !== undefined) {
+    const match = /^(desc|asc):(\d+)$/.exec(query.cursor)
+    if (!match || match[1] !== (recent ? 'desc' : 'asc'))
+      throw new Error('invalid cursor direction')
+    const seq = Number(match[2])
+    sorted = sorted.filter((x) => (recent ? x.seq < seq : x.seq > seq))
   }
-  return matches
+  const limit = boundedInteger(query.limit, 20, 100)
+  const page = sorted.slice(0, limit)
+  return {
+    items: page,
+    next_cursor:
+      sorted.length > page.length
+        ? `${recent ? 'desc' : 'asc'}:${page.at(-1)!.seq}`
+        : null,
+  }
 }
-
-/**
- * Read one history item's text by its logged seq, without scanning the log.
- * @param session - session whose log supplies the history.
- * @param seq - the item's event seq (as returned by a search).
- * @param windowCount - number of rollovers committed so far.
- * @param rolloverSeqs - seqs of the rollover summary events, ascending.
- * @param maxChars - hard character bound for the returned text.
- * @returns the item, or `null` when the seq is unknown, still on the active
- *   surface, a rollover checkpoint, or carries no text.
- */
+function metadata(item: HistoryItem) {
+  const { content: _content, seq: _seq, ...result } = item
+  return result
+}
+/** List or search archived items with stable directional sequence cursors. */
+export function searchHistory(session: Session, query: HistoryQuery = {}) {
+  const filtered = collectHistory(session).filter(
+    (item) =>
+      (query.window_id === undefined || item.window_id === query.window_id) &&
+      (query.role === undefined || item.role === query.role) &&
+      (query.tool_name === undefined ||
+        item.tool_names.includes(query.tool_name)) &&
+      (query.query === undefined || item.content.includes(query.query)),
+  )
+  const page = slicePage(filtered, query)
+  const max = boundedInteger(query.max_chars_per_item, 1000, 4000)
+  return {
+    ...page,
+    items: page.items.map((item) => {
+      const chars = Array.from(item.content)
+      const offset =
+        query.query === undefined
+          ? 0
+          : Math.max(
+              0,
+              Array.from(
+                item.content.slice(0, item.content.indexOf(query.query)),
+              ).length - 80,
+            )
+      return {
+        ...metadata(item),
+        content: chars.slice(offset, offset + max).join(''),
+        offset_chars: offset,
+        truncated: chars.length > offset + max,
+      }
+    }),
+  }
+}
+/** List only windows that actually contain archived messages. */
+export function listWindows(session: Session, query: HistoryQuery = {}) {
+  const counts = new Map<string, number>()
+  for (const item of collectHistory(session))
+    counts.set(item.window_id, (counts.get(item.window_id) ?? 0) + 1)
+  const page = slicePage(
+    windows(session)
+      .filter((w) => counts.has(w.window_id))
+      .map((w) => ({ ...w, seq: w.start_seq + 1 })),
+    query,
+  )
+  return {
+    ...page,
+    items: page.items.map((w) => ({
+      window_id: w.window_id,
+      ordinal: w.ordinal,
+      item_count: counts.get(w.window_id)!,
+    })),
+  }
+}
+/** Read a Unicode code point slice of one archived item; reject active and cross-session references. */
 export function readHistoryItem(
   session: Session,
-  seq: number,
-  windowCount: number,
-  rolloverSeqs: readonly Seq[],
-  maxChars = 4000,
-): HistoryItem | null {
-  if (session.surface.nodes.includes(seq as Seq)) return null
-  const event = sessionEventAt(session, seq)
-  if (event === undefined) return null
-  let kind: HistoryItemKind
-  let text: string
-  switch (event.type) {
-    case 'user/message': {
-      const direct = directUserText(event)
-      if (direct === null) return null
-      kind = 'user'
-      text = direct
-      break
+  windowId: string,
+  itemId: string,
+  offset = 0,
+  limit = 12000,
+) {
+  const item = normalizedItems(session).find(
+    (i) => i.item_id === itemId && i.window_id === windowId,
+  )
+  if (!item) throw new Error('not_found: no item in this session and window')
+  if (session.surface.nodes.some((seq) => seq === item.seq))
+    throw new Error('not_archived: item is still in the active context')
+  const chars = Array.from(item.content)
+  boundedInteger(offset, 0, chars.length, 0)
+  boundedInteger(limit, 12000, 20000)
+  const end = Math.min(chars.length, offset + limit)
+  return {
+    ...metadata(item),
+    total_chars: chars.length,
+    content: chars.slice(offset, end).join(''),
+    truncated: end < chars.length,
+    next_offset_chars: end < chars.length ? end : null,
+  }
+}
+/** Bounded current references, excluding this plugin's own control records. */
+export function references(session: Session, cursor?: string) {
+  const active = new Set<number>(session.surface.nodes)
+  const page = slicePage(
+    normalizedItems(session).filter((item) => active.has(item.seq)),
+    {
+      limit: 32,
+      ...(cursor === undefined ? {} : { cursor }),
+    },
+  )
+  const items: {
+    window_id: string
+    item_id: string
+    event_type: string
+    role: HistoryItem['role']
+    source: Json
+    tool_names: string[]
+    preview: string
+  }[] = []
+  let bytes = 0
+  for (const item of page.items) {
+    const value = {
+      window_id: item.window_id,
+      item_id: item.item_id,
+      event_type: item.event_type,
+      role: item.role,
+      source: item.source?.kind ?? null,
+      tool_names: item.tool_names,
+      preview: Array.from(item.content).slice(0, 80).join(''),
     }
-    case 'assistant/message':
-      kind = 'assistant'
-      text = messageBlocksText(event.data.message.content)
-      break
-    case 'tool/result':
-      kind = 'tool-result'
-      text = messageBlocksText(event.data.message.content)
-      break
-    default:
-      return null
+    const size = Buffer.byteLength(JSON.stringify(value)) + 1
+    if (bytes + size > 3800) break
+    items.push(value)
+    bytes += size
   }
-  if (text.length === 0) return null
-  const item: HistoryItem = {
-    seq: event.seq as Seq,
-    kind,
-    window: windowForSeq(event.seq, windowCount, rolloverSeqs),
-    text,
+  const last = items.at(-1)
+  return {
+    items,
+    next_cursor:
+      items.length < page.items.length && last
+        ? `desc:${last.item_id}`
+        : page.next_cursor,
   }
-  if (item.text.length > maxChars) {
-    return { ...item, text: `${item.text.slice(0, maxChars)}…` }
-  }
-  return item
+}
+export function referenceText(session: Session): string {
+  return `<context_references>\n${JSON.stringify(references(session))}\n</context_references>`
 }

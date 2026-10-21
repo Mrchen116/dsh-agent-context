@@ -1,5 +1,4 @@
 {
-  "_comment": "Local copy of the DSH harness base flags, for typechecks that must not depend on the checkout (compat). Keep in sync with ../deepseek-harness/tsconfig.base.json.",
   "compilerOptions": {
     "target": "es2024",
     "module": "esnext",

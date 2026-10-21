@@ -1,3 +1,0 @@
-name: Standard + rollover (experimental)
-description: Full coding agent with model-driven context rollover instead of summarization (generated from standard). Experimental opt-in; standard remains the default.
-order: 2

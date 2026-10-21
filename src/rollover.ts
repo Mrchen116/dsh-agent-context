@@ -1,14 +1,4 @@
-/**
- * The rollover surface transaction. A rollover is a genuine DSH compaction:
- * the same `compaction/start` lock, `compaction/summary` record, replacement
- * `user/message` with full source provenance, and `compaction/end` close as
- * `dsh-compaction-basic` — but the summary is a deterministic checkpoint
- * (notes plus an optional handoff), never an LLM call. Raw events stay
- * persisted; a recent verbatim tail stays on the surface outside the
- * replacement.
- *
- * @module dsh-context-rollover/rollover
- */
+/** Native paired compaction transactions with deterministic control-state checkpoints. */
 
 import { randomUUID } from 'node:crypto'
 import {
@@ -25,29 +15,13 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import { nodeHeuristicTokens, replaceSurfaceOp, sessionEventAt, sessionEvents } from './compat.ts'
-import type { Seq } from './compat.ts'
+import type { SessionSeq as Seq } from '@deepseek-ai/dsh-session'
+import { windows } from './history.ts'
 import { buildCheckpointText } from './checkpoint.ts'
-import type { CheckpointInput, RolloverReason } from './checkpoint.ts'
-
-/**
- * Cordis plugin name this engine registers under, as it appears in message
- * `source.plugin` and in loader diagnostics.
- */
-export const PLUGIN_NAME = 'context-rollover'
-
-/**
- * Prefix of the pressure reminder's message summary.
- *
- * One constant serves both the sender and {@link isPressureReminder}, so the
- * two can never disagree about what a reminder looks like. The engine's own
- * plugin name is part of the test, and the package name is not: a predicate
- * keyed on `dsh-context-rollover` matches nothing the engine writes.
- */
-export const REMINDER_SUMMARY_PREFIX = 'context pressure reminder'
+import type { CheckpointInput } from './checkpoint.ts'
 
 /** The compaction/summary `provider` value written by this backend. */
-export const ROLLOVER_PROVIDER = 'dsh-context-rollover'
+export const ROLLOVER_PROVIDER = 'dsh-agent-context'
 
 /** Transaction inputs the engine resolves before committing. */
 export interface RolloverDependencies {
@@ -67,11 +41,8 @@ interface SurfaceSelection {
 export interface CommitRolloverOptions {
   /** `current-turn` derives the open turn's number; `null` writes a standalone bracket. */
   readonly owner: 'current-turn' | null
-  /** Checkpoint inputs the engine already resolved (notes, handoff, recovery). */
-  readonly checkpoint: Omit<CheckpointInput, 'reason' | 'windowNumber'> & {
-    readonly reason: RolloverReason
-    readonly windowNumber: number
-  }
+  /** Effective runtime state and body-free recovery navigation. */
+  readonly checkpoint: CheckpointInput
   /** Manual command that initiated this rollover, when present. */
   readonly sourceCommandId?: CommandId
   /** Optional durability checkpoint after a successfully closed bracket. */
@@ -79,69 +50,51 @@ export interface CommitRolloverOptions {
 }
 
 /**
- * Select the replacement range for a rollover: everything except a token-
- * budgeted recent tail, with the cut moved backward until it does not split
- * an assistant tool-call/result pair.
- * @param session - session supplying authoritative current surface positions.
- * @param measurement - unified pressure and surface measurement from the meter.
- * @param retainTokens - minimum recent tail budget retained verbatim.
- * @returns the inclusive positional seq range to replace, or `null` when the
- *   surface has no usable compactable span (nothing would be freed).
+ * Select the entire paired conversation after the immutable system head.
+ * @param session - Current session surface.
+ * @param measurement - Meter snapshot for that surface.
+ * @returns Full replaceable span, or null while tool pairing is incomplete.
  */
 export function selectRolloverRange(
   session: Session,
   measurement: TokenMeasurement,
-  retainTokens: number,
 ): { start: Seq; end: Seq; shadowedSeqs: readonly Seq[] } | null {
-  const pricedNodes = measurement.nodes
-  if (pricedNodes.length === 0) return null
-
-  const surfaceNodes = session.surface.nodes
-  if (surfaceNodes.length !== pricedNodes.length
-    || surfaceNodes.some((seq, index) => seq !== pricedNodes[index]?.seq)) {
-    throw new Error('context-rollover: token-meter surface does not match the current session surface')
-  }
-
-  let accumulated = 0
-  let keepFromIdx: number | undefined
-  for (let index = pricedNodes.length - 1; index >= 0; index -= 1) {
-    accumulated += pricedNodes[index]?.tokens ?? 0
-    keepFromIdx = index
-    if (accumulated >= retainTokens) break
-  }
-  const first = surfaceNodes[0]
-  // A `system/message` at surface node 0 is never inside the range: newer
-  // hosts reject rewriting it with anything but a single-node system rewrite.
-  // Without one the range starts at node 0, which keeps this identical to the
-  // old behavior on hosts without a system head.
-  const head = first === undefined ? undefined : sessionEventAt(session, first)
-  const firstIdx = head !== undefined && (head.type as string) === 'system/message' ? 1 : 0
-  if (keepFromIdx === undefined || keepFromIdx <= firstIdx) return null
-
-  while (keepFromIdx > firstIdx) {
-    const candidate = surfaceNodes[keepFromIdx]
-    if (candidate !== undefined && toolPairingBalancedBefore(session, candidate)) break
-    keepFromIdx -= 1
-  }
-  if (keepFromIdx <= firstIdx) return null
-
-  const start = surfaceNodes[firstIdx]
-  const cutoff = surfaceNodes[keepFromIdx - 1]
-  if (start === undefined || cutoff === undefined) return null
-  return {
-    start,
-    end: cutoff,
-    shadowedSeqs: surfaceNodes.slice(firstIdx, keepFromIdx),
-  }
+  const nodes = session.surface.nodes
+  if (
+    nodes.length !== measurement.nodes.length ||
+    nodes.some((seq, i) => seq !== measurement.nodes[i]?.seq)
+  )
+    throw new Error('token-meter surface mismatch')
+  const first = nodes[0]
+  const startIndex =
+    first !== undefined && session.eventAt(first)?.type === 'system/message'
+      ? 1
+      : 0
+  const start = nodes[startIndex]
+  const end = nodes.at(-1)
+  if (
+    start === undefined ||
+    end === undefined ||
+    !toolPairingBalancedBefore(session, start) ||
+    !toolPairingBalancedAfter(session, end)
+  )
+    return null
+  return { start, end, shadowedSeqs: nodes.slice(startIndex) }
 }
 
 /** Validate one requested surface-position span before committing. */
-function validateSurfaceRegion(session: Session, start: Seq, end: Seq): SurfaceSelection {
+function validateSurfaceRegion(
+  session: Session,
+  start: Seq,
+  end: Seq,
+): SurfaceSelection {
   const nodes = session.surface.nodes
   const startIdx = nodes.indexOf(start)
   const endIdx = nodes.indexOf(end)
-  if (startIdx === -1) throw new Error(`rollover: start seq ${start} not found in surface`)
-  if (endIdx === -1) throw new Error(`rollover: end seq ${end} not found in surface`)
+  if (startIdx === -1)
+    throw new Error(`rollover: start seq ${start} not found in surface`)
+  if (endIdx === -1)
+    throw new Error(`rollover: end seq ${end} not found in surface`)
   if (startIdx > endIdx) {
     throw new Error(
       `rollover: start seq ${start} (position ${startIdx}) is after end seq ${end} (position ${endIdx}) on the surface`,
@@ -153,18 +106,30 @@ function validateSurfaceRegion(session: Session, start: Seq, end: Seq): SurfaceS
     throw new Error('rollover: span bounds vanished from the surface')
   }
   if (!toolPairingBalancedBefore(session, startNode)) {
-    throw new Error(`rollover: start seq ${start} is not a balanced boundary (would split a tool-call/result pair)`)
+    throw new Error(
+      `rollover: start seq ${start} is not a balanced boundary (would split a tool-call/result pair)`,
+    )
   }
   if (!toolPairingBalancedAfter(session, endNode)) {
-    throw new Error(`rollover: end seq ${end} is not a balanced boundary (would split an open step)`)
+    throw new Error(
+      `rollover: end seq ${end} is not a balanced boundary (would split an open step)`,
+    )
   }
-  return { start, end, startIdx, endIdx, shadowedSeqs: nodes.slice(startIdx, endIdx + 1) }
+  return {
+    start,
+    end,
+    startIdx,
+    endIdx,
+    shadowedSeqs: nodes.slice(startIdx, endIdx + 1),
+  }
 }
 
 /** Entry state: open turn, unmatched compaction lock, and latest end-seed boundary. */
 interface RolloverEntryState {
   readonly openTurn: number | null
-  readonly unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined
+  readonly unmatchedCompactionStart:
+    | SessionEvent<'compaction/start'>
+    | undefined
   readonly latestEndSeedSeq: Seq | undefined
 }
 
@@ -176,7 +141,7 @@ function inspectEntryState(session: Session): RolloverEntryState {
   let compactionEntryStateKnown = false
   let latestEndSeedSeq: Seq | undefined
   for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
-    const event = sessionEventAt(session, seq)
+    const event = session.snapshotEvents()[seq]
     if (event === undefined) continue
     if (latestEndSeedSeq === undefined && event.type === 'session/end-seed') {
       latestEndSeedSeq = event.seq
@@ -197,7 +162,12 @@ function inspectEntryState(session: Session): RolloverEntryState {
         openTurnStateKnown = true
       }
     }
-    if (openTurnStateKnown && compactionEntryStateKnown && latestEndSeedSeq !== undefined) break
+    if (
+      openTurnStateKnown &&
+      compactionEntryStateKnown &&
+      latestEndSeedSeq !== undefined
+    )
+      break
   }
   return { openTurn, unmatchedCompactionStart, latestEndSeedSeq }
 }
@@ -224,9 +194,11 @@ export async function commitRollover(
 ): Promise<CompactionResult> {
   const selection = validateSurfaceRegion(session, start, end)
   const entryState = inspectEntryState(session)
-  if (entryState.unmatchedCompactionStart !== undefined
-    && (entryState.latestEndSeedSeq === undefined
-      || entryState.latestEndSeedSeq <= entryState.unmatchedCompactionStart.seq)) {
+  if (
+    entryState.unmatchedCompactionStart !== undefined &&
+    (entryState.latestEndSeedSeq === undefined ||
+      entryState.latestEndSeedSeq <= entryState.unmatchedCompactionStart.seq)
+  ) {
     throw new ManualCompactionError(
       'busy',
       'context-rollover: a compaction is already in progress; the session compaction lock is active',
@@ -236,12 +208,17 @@ export async function commitRollover(
   let owner: number | null
   if (options.owner === null) {
     if (entryState.openTurn !== null) {
-      throw new ManualCompactionError('busy', 'manual rollover: the session already has an open turn')
+      throw new ManualCompactionError(
+        'busy',
+        'manual rollover: the session already has an open turn',
+      )
     }
     owner = null
   } else {
     if (entryState.openTurn === null) {
-      throw new Error('rollover: no open turn — automatic rollover events must be enclosed in a turn')
+      throw new Error(
+        'rollover: no open turn — automatic rollover events must be enclosed in a turn',
+      )
     }
     owner = entryState.openTurn
   }
@@ -249,7 +226,9 @@ export async function commitRollover(
   const compactionId = CompactionId(randomUUID())
   const lifecycle = {
     compactionId,
-    ...options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId },
+    ...(options.sourceCommandId === undefined
+      ? {}
+      : { sourceCommandId: options.sourceCommandId }),
     turn: owner,
   }
   const startEvent = session.append('compaction/start', lifecycle)
@@ -259,49 +238,76 @@ export async function commitRollover(
     // The span is validated, priced, and replaced synchronously — no
     // summarization yield, so no stability recheck is required.
     const measurement = dependencies.meter.measure(session)
-    const selectedNodes = measurement.nodes.slice(selection.startIdx, selection.endIdx + 1)
-    if (selectedNodes.length !== selection.shadowedSeqs.length
-      || selectedNodes.some((node, index) => node.seq !== selection.shadowedSeqs[index])) {
-      throw new Error('rollover: the selected surface changed before the replacement committed')
+    const selectedNodes = measurement.nodes.slice(
+      selection.startIdx,
+      selection.endIdx + 1,
+    )
+    if (
+      selectedNodes.length !== selection.shadowedSeqs.length ||
+      selectedNodes.some(
+        (node, index) => node.seq !== selection.shadowedSeqs[index],
+      )
+    ) {
+      throw new Error(
+        'rollover: the selected surface changed before the replacement committed',
+      )
     }
-    const shadowedTokenCount = selectedNodes.reduce((total, node) => total + nodeHeuristicTokens(node), 0)
-    const shadowedRouteTokenCount = selectedNodes.reduce((total, node) => total + node.tokens, 0)
+    const shadowedTokenCount = selectedNodes.reduce(
+      (total, node) => total + node.heuristicTokens,
+      0,
+    )
+    const shadowedRouteTokenCount = selectedNodes.reduce(
+      (total, node) => total + node.tokens,
+      0,
+    )
 
-    const checkpointText = buildCheckpointText(options.checkpoint)
+    const checkpointText = buildCheckpointText(
+      options.checkpoint,
+      `${session.id}:${startEvent.seq}`,
+    )
     const checkpointMessage = createUserMessage({
       content: [{ type: 'text', text: checkpointText }],
       source: compactCheckpointSource(compactionId, options.sourceCommandId),
     })
-    const framedTokenCount = dependencies.meter.estimateMessage(checkpointMessage)
+    const framedTokenCount =
+      dependencies.meter.estimateMessage(checkpointMessage)
     if (framedTokenCount >= shadowedRouteTokenCount) {
       throw new Error(
-        `rollover checkpoint is not smaller than the shadowed content `
-        + `(${framedTokenCount} estimated tokens >= ${shadowedRouteTokenCount}); `
-        + 'the active context is too small for a useful rollover',
+        `rollover checkpoint is not smaller than the shadowed content ` +
+          `(${framedTokenCount} estimated tokens >= ${shadowedRouteTokenCount}); ` +
+          'the active context is too small for a useful rollover',
       )
     }
 
-    const summaryBlocks: ContentBlock[] = [{ type: 'text', text: checkpointText }]
+    const summaryBlocks: ContentBlock[] = [
+      { type: 'text', text: checkpointText },
+    ]
     const summaryEvent = session.append('compaction/summary', {
       compactionId,
-      ...options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId },
+      ...(options.sourceCommandId === undefined
+        ? {}
+        : { sourceCommandId: options.sourceCommandId }),
       summary: summaryBlocks,
       shadowedRange: { start, end },
       shadowedSeqs: [...selection.shadowedSeqs],
       shadowedTokenCount,
       provider: ROLLOVER_PROVIDER,
-      model: `deterministic/window-${options.checkpoint.windowNumber}`,
+      model: `deterministic/window-${startEvent.seq}`,
     })
     session.append('user/message', checkpointMessage, {
-      // The op shape is host-versioned (see replaceSurfaceOp); the cast is
-      // the single typed escape for the line this host does not declare.
-      surfaceOp: replaceSurfaceOp(start, end) as never,
-      sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...selection.shadowedSeqs],
+      surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
+      sourceEventSeqs: [
+        startEvent.seq,
+        summaryEvent.seq,
+        ...selection.shadowedSeqs,
+      ],
     })
     const endEvent = session.append('compaction/end', lifecycle)
     result = {
       compactionId,
-      ...options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId },
+      ...(options.sourceCommandId === undefined
+        ? {}
+        : { sourceCommandId: options.sourceCommandId }),
       startSeq: startEvent.seq,
       summarySeq: summaryEvent.seq,
       endSeq: endEvent.seq,
@@ -312,7 +318,10 @@ export async function commitRollover(
     }
   } catch (error: unknown) {
     try {
-      session.append('compaction/end', { ...lifecycle, error: errorChain(error) })
+      session.append('compaction/end', {
+        ...lifecycle,
+        error: errorChain(error),
+      })
     } catch {
       // The unmatched start stays durable evidence of the failed attempt; the
       // original failure is the one callers must see.
@@ -320,161 +329,13 @@ export async function commitRollover(
     throw error
   }
 
-  if (result === undefined) throw new Error('rollover committed without a result')
+  if (result === undefined)
+    throw new Error('rollover committed without a result')
   if (options.flush !== undefined) await options.flush()
   return result
 }
 
-/**
- * Count the rollovers this backend has committed on one session, from the
- * durable compaction/summary records it wrote.
- * @param session - session to inspect.
- * @returns the committed rollover count (0 = the first window is still active).
- */
+/** Number of successful native context boundaries, including other compaction providers. */
 export function countRollovers(session: Session): number {
-  let count = 0
-  for (const event of sessionEvents(session)) {
-    if (event.type === 'compaction/summary' && event.data.provider === ROLLOVER_PROVIDER) {
-      count += 1
-    }
-  }
-  return count
-}
-
-/**
- * Collect the seqs of this backend's rollover summary events, ascending.
- * @param session - session to inspect.
- * @returns the summary event seqs in log order.
- */
-export function rolloverSummarySeqs(session: Session): Seq[] {
-  const seqs: Seq[] = []
-  for (const event of sessionEvents(session)) {
-    if (event.type === 'compaction/summary' && event.data.provider === ROLLOVER_PROVIDER) {
-      seqs.push(event.seq)
-    }
-  }
-  return seqs
-}
-
-/**
- * Claim registry for pressure reminders, hung on the session object itself.
- *
- * The key is a `Symbol.for(...)` — the global symbol registry — because the
- * two engine rows that observe one pre-step are **separate module instances**:
- * on the Web profile the host bundle row and the session's agent-preset row
- * load this module through different paths, behind a preset `isolate` realm
- * (they cannot share a Cordis container: `compaction` may be provided once).
- * A module-scoped Set or WeakMap is therefore invisible to the other row, and
- * the durable log cannot help either: `agent/pre-step` is a waterfall, and the
- * decisions of both rows are appended only after the dispatch returns, so both
- * rows decide before either delivery exists in the log.
- *
- * What both rows *do* share is the Session instance they are handed. A global
- * symbol property on it is readable by any module instance, is invisible to
- * serialization and to `Object.keys`, and dies with the session — which is
- * exactly the lifetime a claim needs.
- */
-const CLAIM_KEY = Symbol.for('dsh.context-rollover.reminder-claims')
-
-/** The claimed window numbers on one session, created on first use. */
-function claimsOn(session: Session): Set<number> {
-  const carrier = session as unknown as Record<symbol, unknown>
-  const existing = carrier[CLAIM_KEY]
-  if (existing instanceof Set) return existing as Set<number>
-  const created = new Set<number>()
-  try {
-    Object.defineProperty(session, CLAIM_KEY, {
-      value: created,
-      enumerable: false,
-      configurable: true,
-      writable: false,
-    })
-  } catch {
-    // A frozen session still works: fall back to a process-local set, which
-    // covers single-row deployments and loses only the cross-row case.
-    fallbackClaims.set(session, created)
-  }
-  return created
-}
-
-/** Claims for sessions that refuse the symbol property. */
-const fallbackClaims = new WeakMap<Session, Set<number>>()
-
-/**
- * Identity of the context window a reminder would belong to: the session plus
- * its rollover count, so a fresh window may remind again.
- * @param session - session to key.
- * @returns the window key, stable for the life of the window.
- */
-export function reminderWindowKey(session: Session): string {
-  return `${session.id}#${countRollovers(session)}`
-}
-
-/**
- * The one definition of "this event is a pressure reminder".
- *
- * The source carries the engine's own plugin name, which is not the package
- * name: a predicate keyed on `dsh-context-rollover` never matches anything the
- * engine writes, and silently disables whatever depends on it. The summary
- * prefix is shared with the sender for the same reason. Every consumer — the
- * delivery check below and the test harness — reads this predicate, so the
- * definition cannot drift again.
- * @param event - one logged session event.
- * @returns true when the event is this engine's pressure reminder, narrowing
- *   the event to a `user/message` for the caller.
- */
-export function isPressureReminder(event: SessionEvent): event is SessionEvent<'user/message'> {
-  if (event.type !== 'user/message') return false
-  const { source } = event.data
-  return source.kind === 'plugin'
-    && 'plugin' in source
-    && source.plugin === PLUGIN_NAME
-    && source.form === 'notice'
-    && source.summary.startsWith(REMINDER_SUMMARY_PREFIX)
-}
-
-/**
- * Whether a pressure reminder was already delivered in the session's current
- * window, according to the durable log.
- *
- * This is the authority for "once per window" across turns and restarts: every
- * engine row reads the same log, and an in-memory claim cannot survive a
- * process restart. It cannot cover two rows deciding within one waterfall —
- * see the claim registry above for that.
- * @param session - session to inspect.
- * @returns true when the current window already carries a reminder.
- */
-export function reminderDelivered(session: Session): boolean {
-  const windowStart = (rolloverSummarySeqs(session).at(-1) ?? -1) + 1
-  return sessionEvents(session)
-    .some(event => event.seq >= windowStart && isPressureReminder(event))
-}
-
-/**
- * Claim the current window's reminder slot, if nobody has yet.
- *
- * Claiming is synchronous on purpose: two engine rows can decide within one
- * waterfall, before either delivery reaches the log.
- * @param session - session whose window to claim.
- * @returns true when this caller owns the reminder for the window.
- */
-export function claimReminder(session: Session): boolean {
-  if (reminderDelivered(session)) return false
-  const claimed = claimsOn(session)
-  const windowNumber = countRollovers(session)
-  if (claimed.has(windowNumber)) return false
-  claimed.add(windowNumber)
-  return true
-}
-
-/**
- * Drop every in-process claim for one session.
- *
- * Only tests need this: they reuse session ids across cases in one process,
- * while production scopes each claim to the session it was made on.
- * @param session - session whose claims to drop.
- */
-export function resetReminderClaims(session: Session): void {
-  claimsOn(session).clear()
-  fallbackClaims.delete(session)
+  return windows(session).length - 1
 }
