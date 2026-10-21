@@ -1,324 +1,81 @@
-# dsh-context-rollover
+# dsh-agent-context
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle for
-**model-driven context self-management**: the model can deliberately end one
-working context window and continue in a fresh one while preserving durable
-state — with **no summarization**.
+A deterministic context-window engine for **DeepSeek Harness 0.2.1-alpha.1**. It replaces the complete paired conversation after the system head with current runtime state and recovery navigation. It makes no summarization call and carries no conversation tail, note bodies, or handoff text into the new window.
 
-```text
-fresh working context + durable model-managed notes + small recent raw tail + recoverable full history
-```
+Forked from [athif23/dsh-context-rollover](https://github.com/athif23/dsh-context-rollover) at `d74876a90968bd5498b5af0bcc2f327c3131f007`. The original MIT copyright and license remain in [LICENSE](LICENSE). Context guidance and recovery descriptions use the approved adaptations of [OpenAI Codex](https://github.com/openai/codex) commit `464add49587a7cb6032d5ab04faa8a1585947853`; original/adapted golden fixtures are in `tests/prompts/`.
 
-Inspired by the context-management architecture in `openai/codex` (the
-`new_context` tool, token-budget compaction without a summarizer, history/notes
-separation) and `pi-posthorse`. Codex is the architectural reference; DSH is the
-implementation authority — everything runs through DSH's own surface-replace
-protocol and compaction transaction.
+## Install and lifecycle
 
-> **Web profile: rollover only runs in the `standard-rollover` preset.**
->
-> Installing this bundle is not enough on its own. The Web profile composes
-> compaction from the session's **agent preset**, and the default preset
-> (`standard`) stays exactly as shipped: it keeps the built-in summarizer and
-> gets **no rollover tools and no rollover guidance** — no `new_context`, no
-> `get_context_remaining`, no `notes`, no `history`. A `standard` session
-> cannot roll over at all.
->
-> To use it, open a **new** session and select **"Standard + rollover
-> (experimental)"** in the preset picker *before sending the first message* —
-> a session's preset is frozen once its first turn runs.
->
-> Headless and other rosterless profiles are the exception: they have no preset
-> roster, so the host engine serves every session and there is nothing to pick.
+This repository publishes a prebuilt npm tarball. Install a **fixed release URL**, or unpack a development `pnpm pack` artifact into a normal local directory and install that directory through your host's bundle manager. A local `.tgz` is not a directory. Record the release commit and SHA-256; never replace an existing release asset.
 
-## How it works
-
-The plugin provides the active `ctx.compaction` engine (it disables
-`dsh-compaction-basic` in its bundle patch). On the Web profile the engine
-must additionally live in the session's agent preset — see
-[Web profiles](#web-profiles-preset-sessions) below. A rollover is a real DSH
-compaction: `compaction/start` → `compaction/summary` → one replacement
-`user/message` with full source provenance → `compaction/end` — but the
-"summary" is a **deterministic checkpoint** (durable notes plus an optional
-handoff), never an LLM call. Raw session events stay persisted; a
-token-budgeted recent tail stays verbatim on the surface; `deriveMessages()`
-rebuilds automatically.
-
-Responsibilities stay split (the Codex lesson):
-
-| Concern | Owner |
-|---|---|
-| Request a boundary | `new_context` tool (records a pending request only) |
-| Cross the boundary | `agent/pre-step` (before the next model request) and `agent/turn-stopping` |
-| Track windows | rollover count + summary seqs read from the durable log |
-| Measure pressure | `ctx.tokenMeter` + the routed model's context window |
-| Replace the surface | `commitRollover` inside DSH's compaction transaction |
-| Preserve selected state | `notes` tool (markdown files per session) |
-| Recover old details | `history` tool (search/read over shadowed surface events) |
-
-### Model-facing tools
-
-- **`new_context({ handoff? })`** — request a context boundary at the next safe
-  point. The handoff (bounded) becomes part of the new window's checkpoint. The
-  boundary is crossed at a safe lifecycle point, never mid-tool-batch.
-- **`get_context_remaining()`** — honest headroom: tokens left before the hard
-  window and before the automatic rollover, or "not measured yet".
-- **`notes`** — `list | read | write | append | search` over per-session
-  markdown files under `<dsh home>/notes/<session id>/`. Nothing is written
-  automatically; the model decides what survives.
-- **`history`** — `search | read` over conversation that left the active
-  surface. Targeted recovery, not wholesale reconstruction.
-
-### Rollover paths
-
-1. **Model-driven** (preferred): the model saves notes, calls `new_context`
-   with a short handoff at a phase boundary (research → implementation, etc.).
-2. **Pressure** (safety net): above `thresholdRatio` of the window the engine
-   rolls over automatically with durable notes and the recent verbatim tail.
-   Below that, a **one-per-window** checkpoint reminder suggests saving notes
-   and rolling over.
-3. **Overflow**: a provider-confirmed `CONTEXT_WINDOW_EXCEEDED` forces a
-   rollover with the same notes + tail checkpoint and retries the request.
-4. **Manual**: `/compact` keeps working — it performs the same standalone
-   notes + tail rollover on an idle agent.
-
-Only the model-driven path carries a **handoff**. The engine never writes one
-for pressure, overflow, or manual rollovers: producing a handoff itself would
-mean either an LLM summarization call or copying older user messages into the
-fresh window, and the second option revives stale requests. Those paths
-preserve intent through notes and the recent verbatim tail instead.
-
-## What this plugin touches
-
-- **Registers four model-facing tools** (`new_context`, `get_context_remaining`, `notes`, `history`)
-  and one system-prompt section — on headless profiles in every session; on
-  the Web profile only inside `standard-rollover` sessions (other presets stay
-  exactly as shipped).
-- **Writes files** in exactly one place: markdown notes under `<dsh home>/notes/<sessionId>/`.
-  Nothing else on disk is written; no network calls, no telemetry.
-- **Replaces the active compaction backend** (`compaction-basic` is disabled by the bundle patch).
-  Session logs stay fully compatible in both directions.
-- **No credentials, no cloud services, no data leaves the machine.**
-
-## Host version compatibility
-
-The plugin typechecks against **both** host lines: the development checkout and
-its installed profiles (`0.1.6-alpha.1`, via generated tsconfig paths) and the
-newest packages published to public npm (`0.0.1-rc.1`, the
-`pnpm typecheck:compat` probe against `compat/node_modules`). Runtime
-differences are bridged in `src/compat.ts`:
-
-- the session log as `snapshotEvents()` (newer line) or `events` (published);
-- `eventAt(seq)` versus indexing that array;
-- per-node pricing as `heuristicTokens` (newer line) or `tokens`;
-- the replacement operation as `{ startSeq, endSeq }` (newer line) or
-  `{ start, end }`, probed once per process because each line rejects the
-  other's field names.
-
-Note the published `@deepseek-ai/dsh-*` packages are a *partial* mirror: some
-of their peers reference packages that were never published publicly, so a
-standalone npm-only host graph cannot be assembled. That is expected — the
-plugin's peers resolve from the running dsh host's installation closure, and
-installing the plugin itself into a profile fetches only this package.
-
-## Install
-
-From npm (recommended):
-
-```sh
-dsh plugin --profile <profile> add dsh-context-rollover
-# or, without the dsh CLI:
-pnpm --dir "$DSH_HOME/profiles/<profile>" add dsh-context-rollover
-```
-
-A custom profile initializes with just `dsh-base`; the bundle's patch applies
-automatically because the package declares `dsh.bundle.patch`. After the first
-install (a bundle-membership change is a boot-time composition), start the
-profile once — the plugin's peer packages resolve from the running host's
-installation closure, never from npm.
-
-From GitHub instead of npm:
-
-```sh
-dsh plugin --profile <profile> add github:athif23/dsh-context-rollover
-```
-
-From a local checkout (development, see the HMR section below):
-
-```sh
-dsh plugin --profile <profile> add D:/path/to/dsh-context-rollover
-```
-
-**Windows note**: if the plugin loads but its `@deepseek-ai/*` imports fail at
-runtime after an install from Git Bash, pnpm may have materialized broken
-`link:` junctions (a Git Bash/Windows path-mangling bug). Recreate them with
-`cmd /c mklink /J` as described in the HMR section below — the same fix
-applies to any linked sibling package in the profile.
-
-The bundle's `cordis.patch.yml` disables `dsh-compaction-basic` and mounts the
-`context-rollover` engine itself. `command-compact`, the token meter, and the
-compaction invariant companions need no changes — they depend only on
-`ctx.compaction`.
-
-### Web profiles (preset sessions)
-
-Headless and other base-only profiles are done after the install above: the
-host engine *is* the session's engine, no roster exists, and nothing stands
-down. The Web profile is different — its sessions compose compaction from
-their **agent preset**, not from the host — so the bundle additionally
-registers a shipped `standard-rollover` preset ("Standard + rollover
-(experimental)" in the picker) beside the deployment's own set. Restart the
-host once after install, then open **new** sessions on it to try the
-experiment; `standard` stays the default. Pick the preset while the session is
-still **blank**: the creation header is deep-frozen, and a session may only
-change preset before its first turn runs, so an already-started `standard`
-session cannot be moved onto rollover.
-
-No commands, no profile edits. Two behaviors make that hold:
-
-- The host engine **defers to any preset-owned backend**: on a `standard`
-  session the shipped summarizer runs alone (previously the two backends
-  raced each pressure signal); on `standard-rollover` the preset's rollover
-  engine runs alone; headless sessions keep the host engine.
-- The preset's engine row sets `modelSurface: 'always'`, so it is the only
-  source of rollover tools and guidance in its sessions. On preset
-  deployments the host row (`modelSurface: 'auto'`) registers neither, so
-  `standard` and `minimal` sessions never see rollover-framed instructions.
-
-Custom thresholds belong to your own preset copy (the supported customization
-flow: copy `standard-rollover` in the picker and edit the `context-rollover`
-row) — the shipped preset carries the defaults below. If a deployment
-restates the whole `agent-presets` config in a later patch layer, that layer
-wins and hides the shipped preset; re-adding the bundle's root there
-restores it. Uninstalling the bundle removes the preset: sessions already on
-it keep running, new ones must pick another preset.
-
-Maintainers: `presets/standard-rollover/` is generated, not authored —
-re-run `pnpm preset:sync` after harness updates and commit the refresh. The
-sync keeps everything else byte-identical and fails loud when the shipped
-`standard` shape drifts.
-
-Configuration (cordis.yml `config` on the plugin row):
+The bundle patch mounts one isolated compaction owner with `modelSurface: always`. It does not disable host compaction, change web presets, or bundle a second DSH/Cordis runtime. The host owns activation, scoped disposal, idle synchronization, and fallback when the bundle is disabled. Package replacement may require a host restart. Disabling does not delete notes or original session events.
 
 ```yaml
 - insert:
-    - id: context-rollover
-      name: dsh-context-rollover
+    - id: agent-context
+      name: dsh-agent-context
+      isolate:
+        compaction: true
       config:
-        thresholdRatio: 0.9          # automatic rollover point (fraction of window)
-        reminderThresholdRatio: 0.75 # one-time checkpoint reminder point
-        retainRatio: 0.1             # recent verbatim tail (fraction of window)
-        retainTokens: null           # absolute tail budget; overrides retainRatio
-        handoffMaxChars: 20000
-        notesEnabled: true
-        historyEnabled: true
-        notesDir: null               # base dir override; default <dsh home>/notes
-        modelSurface: auto           # auto (host rows) | always (preset rows)
+        modelSurface: always
 ```
 
-## Local development with HMR
+Use the host's `plugin_manager` bundle operations when available. Installing the files is distinct from successfully mounting the service and tools. Native consumers may mount the default exported engine in an isolated Agent scope directly.
 
-The fast loop runs DSH from your checkout with the plugin linked from this
-directory and Cordis HMR watching the source:
+## Configuration
 
-1. **Create a dedicated profile and link this package**
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `modelSurface` | `auto` | `always` mounts four tools and guidance even when a preset roster exists. `auto` defers model-surface registration in roster deployments. |
+| `outputReserveTokens` | `min(32768, floor(C * 0.25))` | Budget-only output reserve when the resolved request has no maxTokens; does not alter the provider request. |
+| `bufferTokens` | `min(16384, floor(H * 0.15))` | Positive integer fallback reserve, B. |
+| `reminderTokens` | `min(6144, floor(W * 0.1))` | Positive integer reminder distance, R. |
+| `models` | `{}` | Exact `provider:model` keys with optional `outputReserveTokens` / `bufferTokens` / `reminderTokens` overrides. |
 
-   ```sh
-   dsh plugin --profile rollover-dev add D:/path/to/dsh-context-rollover
-   ```
+The effective model context window is C; an explicit resolved request-header `maxTokens` is the output reserve O (including adapter defaults). When the request legitimately has no cap, O uses the configured budget-only reserve or the table default. Budget reads label `output_reserve_source` as `request-maxTokens` or `policy-estimate`; the latter does not claim to know the provider output limit. H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C, invalid explicit caps/reserves and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `measurement: awaiting_first_request` and null numeric headroom; subsequent budget reads are estimates, not provider token counts.
 
-   (A custom profile initializes with just `dsh-base`; the bundle's patch
-   applies automatically because the package declares `dsh.bundle.patch`.)
+At W − R the engine sends one reminder per window; at W it sends one save-notes fallback with current committed references. At H or provider overflow it resets at a safe native boundary. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
 
-2. **Enable the `hmr` row** in `$DSH_HOME/profiles/rollover-dev/cordis.patch.yml`
-   (patch rows replace whole configs, so restate `root`):
+## Model tools
 
-   ```yaml
-   - id: hmr
-     config:
-       root: ['.', 'D:/path/to/dsh-context-rollover/src']
-       debounce: 100
-   ```
+- `new_context({})`: records a request for the next paired safe boundary. The result is `requested`, not a claim that compaction already succeeded.
+- `get_context_remaining({references_cursor?})`: returns current `window_id`, `remaining`, T/W/H/C/O/B/R, `estimated`, measurement provenance, and a reference page. A tool invocation can see just-admitted messages already persisted before that tool executes.
+- `notes({action, ...})`: `list`, `read`, `search`, `write`, `append` within the owning Agent session.
+- `history({action, ...})`: `list_windows`, `list_items`, `search`, `read` for messages that have left the active surface.
 
-   The base bundle mounts `hmr` disabled by default; the `timer` row it needs
-   is already active.
+### Notes
 
-3. **Run DSH from source**
+Storage is `<DSH home>/agent-context/<encoded-agent-id>/<encoded-session-id>/notes`. Agent identity here is the public DSH session-backed `Agent.id`, not a Nano business-agent name or a parsed preset identifier. Host `DSH_HOME` determines the home; tools cannot choose another Agent, session, or root. Fresh/fork sessions have their own namespace. This version does not migrate the upstream store.
 
-   ```sh
-   cd /path/to/deepseek-harness
-   pnpm run build          # once; Typert host artifacts are required
-   pnpm dsh --profile rollover-dev
-   ```
+`list` and `search` accept `path_prefix`, `limit` (20, maximum 100), and `cursor`. Listing returns path, UTF-8 byte size, mtime and `next_cursor`, sorted by descending mtime then path. Search is a case-sensitive literal substring search with bounded line snippets.
 
-   Source launch runs through tsx (`node --import tsx/esm`), which is what makes
-   hot reload of TypeScript plugin sources work.
+`read` accepts `path`, inclusive `start_line` (1 by default), `end_line`, `offset_chars` within the starting line, and `max_chars` (12000, maximum 20000). It returns content, `truncated`, `next_line`, and `next_offset_chars`, so even a single oversized line is recoverable. Character offsets count Unicode code points.
 
-4. **Edit `src/*.ts` in this package** — the affected plugin reloads in place;
-   registrations (tools, system-prompt sections, event listeners) unwind and
-   reapply through Cordis effects. Profile patch edits also recompose live
-   (`patchReload: live` is the default for custom profiles).
+`write` atomically replaces a file; `append` appends exactly the supplied text and creates a missing file. Same-file writes serialize. Both return only after the mutation succeeds. Files are limited to 1,000,000 UTF-8 bytes. Invalid relative paths, symbolic links, missing reads, invalid slices, and oversized writes fail explicitly. This is a trusted local plugin's file boundary, not an OS sandbox.
 
-5. **Restart is still required for**: initial bundle installation, bundle
-   membership changes (`dsh.plugin add/remove`), framework-level dependency
-   changes (Cordis falls back to `loader.exit()`), and anything HMR cannot
-   safely swap.
+Automatic hints contain at most five recent paths and 4000 UTF-8 bytes; bodies are available only through explicit reads.
 
-### Windows: `link:` junctions and Git Bash
+### History and references
 
-`pnpm install` in a profile run from Git Bash mangles `link:D:/...`
-specifiers into junctions with invalid targets (the drive colon is treated
-as relative). If a profile's linked plugins fail to load after an install,
-recreate the junctions with the real targets:
+Native successful compaction brackets define window IDs: `<session-id>:initial`, then `<session-id>:<compaction-start-seq>`. Item IDs are persisted event sequence numbers. Display ordinals do not change the identity. Failed/unclosed brackets do not create windows; other compaction providers' successful brackets do. Session replay reproduces the same references.
+
+History preserves original provenance, full tool arguments and persisted result payloads, including metadata. `nano-human` is human input; `nano-system` remains system material; Inbox results remain tool results with their nested provenance. Failed assistant attempts are excluded. Reads reject active items and cross-session references.
+
+List/search accept `window_id`, `role`, `tool_name`, `recent_first` (true), `limit` (20, maximum 100), and a directional `cursor`. Item snippets use `max_chars_per_item` (1000, maximum 4000). `read` requires `window_id` and `item_id`, with `offset_chars` (0) and `limit_chars` (12000, maximum 20000), returning `total_chars`, `next_offset_chars`, and `truncated`.
+
+A dynamic `<context_references>` snapshot of currently active persisted messages provides at most 32 references and 4000 bytes. A full reset starts with an empty reference snapshot; archived items are addressed through History. New inputs appear in the next assembly; `get_context_remaining` can obtain their references sooner after persistence. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
+
+## Development and packaging
+
+Node 24 and pnpm 11.5.2 are used by CI. Build and tests resolve published DSH packages, without a sibling source checkout, generated private paths, or host-version probes.
 
 ```sh
-cmd /c mklink /J "%DSH_HOME%\profiles\web\node_modules\dsh-context-rollover" "D:\path\to\dsh-context-rollover"
-```
-
-(or run the install from PowerShell/cmd). This package's own runtime peers
-are junctions into the shared installation closure at
-`$DSH_HOME/profiles/node_modules/@deepseek-ai/*`. That is what lets the
-engine share the host's module instances: a service plugin that extends
-`CompactionEngine` must import the exact classes the host loaded, so
-resolving its `@deepseek-ai/*` imports through the same closure as the host
-is load-bearing, not an optimization.
-
-## Tests and typecheck (no DSH build needed)
-
-The sibling DSH checkout is the source of truth: `tsconfig.base.json` paths are
-generated into `tsconfig.dsh-paths.json` and vitest aliases execute everything
-from TypeScript source — the same source plane DSH's own suites use. Vendored
-packages typecheck against their built declarations so `skipLibCheck` absorbs
-their relaxed strictness.
-
-```sh
-pnpm install
-pnpm test        # surface, notes, history, engine integration, tool rendering
+pnpm install --frozen-lockfile
 pnpm typecheck
+pnpm test
+pnpm build
+pnpm pack
+shasum -a 256 dsh-agent-context-0.3.0-rc.1.tgz
 ```
 
-Tests mount the real session store, token meter, tool runtime, agent loop, and
-**the compaction invariant companions**, so every committed rollover is
-validated against DSH's own invariants. The integration test proves the
-semantic experiment end to end: the model researches, calls `new_context`
-mid-turn, and the fresh window carries notes + handoff + recent tail while the
-turn continues.
-
-## Scope and limits
-
-- A rollover checkpoint contains durable notes, the model's handoff when it
-  supplied one, and the retained verbatim tail that sits outside the
-  checkpoint. No older user prompts are copied into it.
-- Notes survive context rollovers within a session; no cross-session sync,
-  embeddings, or cloud storage.
-- Notes are files, not session events: `Session.append` cannot mark a plugin's
-  custom event types `ignorable`, so unknown plugin events on a session log
-  would make that log unreadable by any DSH build without the plugin. Only
-  known event types (`compaction/*`, `user/message`) are written.
-- The generic `<compaction>` checkpoint provenance is reused, so transcript UIs
-  recognize rollover checkpoints like any compaction.
-- No DSH core was forked or patched; the plugin only consumes public seams.
-
-## License
-
-MIT
+The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.

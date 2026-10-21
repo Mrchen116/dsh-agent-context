@@ -1,20 +1,18 @@
 /**
- * Shared test harness: a real cordis context with the standard prerequisite
- * services, the invariant companions (so every rollover transaction is
- * validated by DSH's own compaction invariants), and scripted LLM adapters.
+ * Shared test harness: a real cordis context with public published prerequisite
+ * services and scripted LLM adapters.
  *
  * @module tests/harness
  */
 
 import { join } from 'node:path'
+import { afterEach } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import AgentLoop from '@deepseek-ai/dsh-agent-loop'
-import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import InvariantRegistry from '@deepseek-ai/dsh-invariants'
-import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
-import * as AgentInvariant from '@deepseek-ai/dsh-agent/invariant'
-import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
-import * as CompactionInvariant from '@deepseek-ai/dsh-compaction/invariant'
+
+import {
+  mountAgentLoopTestDependencies,
+  mountAgentLoopTestHarness,
+} from '@deepseek-ai/dsh-agent-loop-testkit'
 import {
   createAssistantMessage,
   createToolResultMessage,
@@ -22,12 +20,21 @@ import {
   LlmAdapter,
   ToolCallId,
 } from '@deepseek-ai/dsh-llm'
-import type { LlmResolvedModelInfo, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type {
+  LlmResolvedModelInfo,
+  Message,
+  StreamChunk,
+  GenerateOptions,
+  RequestMessage,
+} from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 
 export const MODEL = 'mock'
+const harnesses = new WeakMap<
+  Context,
+  Awaited<ReturnType<typeof mountAgentLoopTestHarness>>
+>()
 
 /** The scripted adapter's per-request chunk script. */
 export type StreamScript = readonly StreamChunk[][]
@@ -37,9 +44,12 @@ export const CONTEXT_WINDOW = 100_000
 
 /** One text answer per request, with a large advertised context window. */
 export class TextAdapter extends LlmAdapter {
-  readonly requests: Message[][] = []
+  readonly requests: RequestMessage[][] = []
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+  override resolveModel(
+    provider: string,
+    model: string,
+  ): Promise<LlmResolvedModelInfo> {
     return Promise.resolve({
       provider,
       id: model,
@@ -48,10 +58,14 @@ export class TextAdapter extends LlmAdapter {
     })
   }
 
-  override async *stream(options: { messages: readonly Message[] }): AsyncIterable<StreamChunk> {
+  override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.requests.push([...options.messages])
     yield { type: 'block-start', index: 0, blockType: 'text' }
-    yield { type: 'block-end', index: 0, block: { type: 'text', text: 'answer' } }
+    yield {
+      type: 'block-end',
+      index: 0,
+      block: { type: 'text', text: 'answer' },
+    }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
@@ -61,13 +75,16 @@ export class TextAdapter extends LlmAdapter {
  * order; a final entry repeats when the script is exhausted.
  */
 export class ScriptedAdapter extends LlmAdapter {
-  readonly requests: Message[][] = []
+  readonly requests: RequestMessage[][] = []
 
   constructor(private readonly script: StreamScript) {
     super()
   }
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+  override resolveModel(
+    provider: string,
+    model: string,
+  ): Promise<LlmResolvedModelInfo> {
     return Promise.resolve({
       provider,
       id: model,
@@ -76,10 +93,12 @@ export class ScriptedAdapter extends LlmAdapter {
     })
   }
 
-  override async *stream(options: { messages: readonly Message[] }): AsyncIterable<StreamChunk> {
+  override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.requests.push([...options.messages])
-    const entry = this.script[Math.min(this.requests.length - 1, this.script.length - 1)]
-    if (entry === undefined) throw new Error('scripted adapter ran out of entries')
+    const entry =
+      this.script[Math.min(this.requests.length - 1, this.script.length - 1)]
+    if (entry === undefined)
+      throw new Error('scripted adapter ran out of entries')
     for (const chunk of entry) yield chunk
   }
 }
@@ -95,39 +114,56 @@ export function textResponse(text: string): StreamChunk[] {
 }
 
 /** One streamed `new_context` tool call with the given JSON arguments. */
-export function newContextCall(argumentsJson: string, callId = 'c1'): StreamChunk[] {
+export function newContextCall(
+  argumentsJson: string,
+  callId = 'c1',
+): StreamChunk[] {
   return toolCall('new_context', argumentsJson, callId)
 }
 
 /** One streamed tool call for any registered tool name. */
-export function toolCall(name: string, argumentsJson: string, callId = 'c1'): StreamChunk[] {
+export function toolCall(
+  name: string,
+  argumentsJson: string,
+  callId = 'c1',
+): StreamChunk[] {
   return [
     { type: 'block-start', index: 0, blockType: 'tool-call' },
-    { type: 'tool-call-delta', index: 0, id: ToolCallId(callId), name, argumentsDelta: argumentsJson.slice(0, 5) },
-    { type: 'tool-call-delta', index: 0, id: ToolCallId(callId), argumentsDelta: argumentsJson.slice(5) },
-    { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(callId), name, arguments: argumentsJson } },
+    {
+      type: 'tool-call-delta',
+      index: 0,
+      id: ToolCallId(callId),
+      name,
+      argumentsDelta: argumentsJson.slice(0, 5),
+    },
+    {
+      type: 'tool-call-delta',
+      index: 0,
+      id: ToolCallId(callId),
+      argumentsDelta: argumentsJson.slice(5),
+    },
+    {
+      type: 'block-end',
+      index: 0,
+      block: {
+        type: 'tool-call',
+        id: ToolCallId(callId),
+        name,
+        arguments: argumentsJson,
+      },
+    },
     { type: 'finish', reason: { kind: 'tool-calls' } },
   ]
 }
 
 /**
- * Mount the full prerequisite stack, including the invariant companions: every
- * committed rollover is checked against DSH's own session/agent/compaction
- * invariants.
+ * Mount the public release prerequisite stack and real AgentLoop test driver.
  */
 export async function mountTestContext(): Promise<Context> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
-  await ctx.plugin(InvariantRegistry)
-  await ctx.plugin(SessionInvariant)
-  await ctx.plugin(AgentInvariant)
-  await ctx.plugin(AgentLoopInvariant)
-  await ctx.plugin(CompactionInvariant)
-  // Newer checkouts mount the projection registry inside
-  // mountAgentLoopTestDependencies; older ones do not. Mount it exactly once
-  // either way so the harness works against both host lines.
-  if (ctx.get('sessionProjections') === undefined) await ctx.plugin(SessionProjectionRegistry)
-  await ctx.plugin(AgentLoop, { agents: [] })
+  const harness = await mountAgentLoopTestHarness(ctx)
+  harnesses.set(ctx, harness)
   await ctx.plugin(TokenMeter)
   return ctx
 }
@@ -143,10 +179,14 @@ export function appendExchange(
   withToolCall = false,
 ): void {
   session.append('turn/start', { turn })
-  session.append('user/message', createUserMessage({
-    content: [{ type: 'text', text: `user: ${text}` }],
-    source: { kind: 'user' },
-  }), { surfaceOp: 'append' })
+  session.append(
+    'user/message',
+    createUserMessage({
+      content: [{ type: 'text', text: `user: ${text}` }],
+      source: { kind: 'user' },
+    }),
+    { surfaceOp: 'append' },
+  )
   session.append('step/start', { turn, step: 1 })
   if (turn === 1) {
     session.append('request/header', {
@@ -154,32 +194,42 @@ export function appendExchange(
       reason: 'initial',
     })
   }
-  session.append('assistant/message', {
-    stream: [],
-    turn,
-    step: 1,
-    message: createAssistantMessage({
-      content: withToolCall
-        ? [{
-            type: 'tool-call',
-            id: ToolCallId(`t${turn}`),
-            name: 'demo_tool',
-            arguments: '{"x":1}',
-          }]
-        : [{ type: 'text', text: `assistant: ${text}` }],
-      source: { provider: MODEL, model: MODEL },
-    }),
-  }, { surfaceOp: 'append' })
-  if (withToolCall) {
-    session.append('tool/result', {
+  session.append(
+    'assistant/message',
+    {
+      stream: [],
       turn,
       step: 1,
-      message: createToolResultMessage({
-        callId: ToolCallId(`t${turn}`),
-        content: [{ type: 'text', text: `result: ${text}` }],
-        isError: false,
+      message: createAssistantMessage({
+        content: withToolCall
+          ? [
+              {
+                type: 'tool-call',
+                id: ToolCallId(`t${turn}`),
+                name: 'demo_tool',
+                arguments: '{"x":1}',
+              },
+            ]
+          : [{ type: 'text', text: `assistant: ${text}` }],
+        source: { provider: MODEL, model: MODEL },
       }),
-    }, { surfaceOp: 'append' })
+    },
+    { surfaceOp: 'append' },
+  )
+  if (withToolCall) {
+    session.append(
+      'tool/result',
+      {
+        turn,
+        step: 1,
+        message: createToolResultMessage({
+          callId: ToolCallId(`t${turn}`),
+          content: [{ type: 'text', text: `result: ${text}` }],
+          isError: false,
+        }),
+      },
+      { surfaceOp: 'append' },
+    )
   }
   session.append('step/end', { turn, step: 1 })
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
@@ -187,7 +237,9 @@ export function appendExchange(
 
 /** A closed multi-turn session with tool calls in the early exchanges. */
 export function closedConversation(turns = 4): Session {
-  const session = Session.create(SessionId(`closed-${turns}-${Math.random().toString(36).slice(2, 8)}`))
+  const session = Session.create(
+    SessionId(`closed-${turns}-${Math.random().toString(36).slice(2, 8)}`),
+  )
   for (let index = 1; index <= turns; index += 1) {
     appendExchange(session, index, `exchange ${index}`, index <= 2)
   }
@@ -196,20 +248,28 @@ export function closedConversation(turns = 4): Session {
 
 /** The text of every derived model-visible message, in request order. */
 export function derivedTexts(session: Session): string[] {
-  return session.deriveMessages().map((message: Message) => message.content
-    .map(block => block.type === 'text' ? block.text : `[${block.type}]`)
-    .join(''))
+  return session
+    .deriveMessages()
+    .map((message: Message) =>
+      message.content
+        .map((block) =>
+          block.type === 'text' ? block.text : `[${block.type}]`,
+        )
+        .join(''),
+    )
 }
 
 // ---- engine test harness (shared by engine.spec.ts and safety.spec.ts) ----
 
 const cleanup: Array<() => Promise<void>> = []
+afterEach(async () => {
+  for (const dispose of cleanup.splice(0).reverse()) await dispose()
+})
 
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ContextRolloverEngine } from '../src/index.ts'
-import { isPressureReminder } from '../src/rollover.ts'
 import type { RolloverConfig } from '../src/config.ts'
 
 /** A notes base directory for one test. */
@@ -231,16 +291,31 @@ export interface EngineHarness {
 export async function engineHarness(
   id: string,
   config: Partial<RolloverConfig> = {},
+  options: { maxTokens?: number } = { maxTokens: 10000 },
 ): Promise<EngineHarness> {
   const ctx = await mountTestContext()
   const notesBase = await tempNotesDir()
-  const engine = new ContextRolloverEngine(ctx, { notesDir: notesBase, retainTokens: 40, ...config })
-  const agent = await ctx.agentLoop.create(SessionId(id), { provider: MODEL, model: MODEL })
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = notesBase
+  cleanup.push(async () => {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+  })
+  cleanup.push(async () => {
+    await ctx.fiber.dispose()
+  })
+  const engine = new ContextRolloverEngine(ctx, config)
+  const agent = await harnesses
+    .get(ctx)!
+    .create(SessionId(id), { provider: MODEL, model: MODEL, ...options })
   return { ctx, engine, agent, session: agent.session, notesBase }
 }
 
 /** One scripted response with an honest usage baseline of `inputTokens`. */
-export function usageResponse(text: string, inputTokens: number): StreamChunk[] {
+export function usageResponse(
+  text: string,
+  inputTokens: number,
+): StreamChunk[] {
   return [
     ...textResponse(text).slice(0, -1),
     { type: 'usage', usage: { inputTokens, outputTokens: 5 } },
@@ -250,34 +325,32 @@ export function usageResponse(text: string, inputTokens: number): StreamChunk[] 
 
 /** One scripted response that fails with the given provider failure code. */
 export function errorFinish(message: string, code: string): StreamChunk[] {
-  return [{ type: 'finish', reason: { kind: 'error', failure: { message, code } } }]
+  return [
+    { type: 'finish', reason: { kind: 'error', failure: { message, code } } },
+  ]
 }
 
 /**
  * The plugin-attributed pressure reminder texts in the durable log.
  *
- * The predicate is the engine's own (`isPressureReminder`), so a test can
  * never disagree with the engine about what counts as a delivered reminder.
  */
-export function reminderTexts(session: Session): string[] {
-  return session.snapshotEvents()
-    .filter(isPressureReminder)
-    .map(event => event.data.content[0])
-    .filter(block => block?.type === 'text')
-    .map(block => block?.type === 'text' ? block.text : '')
-}
-
 /** Send one direct user message to the agent and wait for the turn to close. */
 export async function followup(agent: Agent, text: string): Promise<void> {
-  agent.followup(createUserMessage({
-    content: [{ type: 'text', text }],
-    source: { kind: 'user' },
-  }))
+  agent.followup(
+    createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    }),
+  )
   await agent.whenIdle()
 }
 
 /** Seed `count` small exchanges so a rollover has real content to shadow. */
-export async function seedExchanges(agent: Agent, count: number): Promise<void> {
+export async function seedExchanges(
+  agent: Agent,
+  count: number,
+): Promise<void> {
   for (let index = 0; index < count; index += 1) {
     await followup(agent, `research question ${index}`)
   }

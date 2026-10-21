@@ -1,109 +1,71 @@
-/**
- * Notes store tests: write/read/append/search/list semantics, path safety,
- * and the bounded checkpoint snapshot.
- *
- * @module tests/notes.spec
- */
-
-import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, rm, symlink, chmod, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { NotesStore, resolveNotePath } from '../src/notes.ts'
-
-const cleanup: Array<() => Promise<void>> = []
-
+import { afterEach, expect, it } from 'vitest'
+import { NotesStore } from '../src/notes.ts'
+const dirs: string[] = []
 afterEach(async () => {
-  while (cleanup.length > 0) {
-    const dispose = cleanup.pop()
-    if (dispose !== undefined) await dispose()
-  }
+  for (const dir of dirs.splice(0))
+    await rm(dir, { recursive: true, force: true })
 })
-
-/** A store rooted at a fresh temp directory. */
-async function tempStore(): Promise<NotesStore> {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-rollover-notes-'))
-  cleanup.push(() => rm(dir, { recursive: true, force: true }))
+async function store() {
+  const dir = await mkdtemp(join(tmpdir(), 'agent-context-'))
+  dirs.push(dir)
   return new NotesStore(dir)
 }
-
-describe('NotesStore', () => {
-  it('writes, reads, lists, appends, and searches notes', async () => {
-    const store = await tempStore()
-    await store.write('state.md', '# goal\nprove rollover')
-    await store.write('plans/rollout.md', 'step 1\nstep 2')
-    await store.append('state.md', 'decided: no summary')
-    await store.append('state.md', 'next: tests')
-
-    expect(await store.read('state.md')).toBe('# goal\nprove rollover\ndecided: no summary\nnext: tests\n')
-
-    const listings = await store.list()
-    expect(listings.map(listing => listing.path).sort()).toEqual(['plans/rollout.md', 'state.md'])
-
-    const matches = await store.search('SUMMARY')
-    expect(matches).toHaveLength(1)
-    expect(matches[0]).toMatchObject({ path: 'state.md', line: 3 })
-  })
-
-  it('creates the file when append finds nothing to read', async () => {
-    const store = await tempStore()
-    await store.append('fresh.md', 'first line')
-    await store.append('fresh.md', 'second line')
-    expect(await store.read('fresh.md')).toBe('first line\nsecond line\n')
-  })
-
-  // A note that exists but cannot be read is not an empty note. Append
-  // rewrites the whole file from what it read, so mistaking one for the other
-  // replaces the note with the appended text and reports success.
-  // chmod 0o200 leaves the file writable and unreadable, which is exactly the
-  // asymmetry that made the old `catch { current = '' }` destructive.
-  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
-    'refuses to overwrite a note it cannot read',
-    async () => {
-      const store = await tempStore()
-      await store.write('state.md', 'existing\n')
-      const absolute = join(store.root, 'state.md')
-      const original = await readFile(absolute, 'utf8')
-      await chmod(absolute, 0o200)
-      try {
-        await expect(store.append('state.md', 'appended')).rejects.toMatchObject({ code: 'EACCES' })
-      } finally {
-        await chmod(absolute, 0o600)
-      }
-      // The whole point of the fix: the note survives byte for byte.
-      expect(await readFile(absolute, 'utf8')).toBe(original)
-    },
+it('appends exactly, serializes concurrent writes and rejects oversized UTF-8 without changing the file', async () => {
+  const s = await store()
+  await s.write('计划.md', 'A')
+  await Promise.all([s.append('计划.md', 'B'), s.append('计划.md', '\nC')])
+  expect(await s.read('计划.md')).toBe('AB\nC')
+  await expect(s.append('计划.md', '中'.repeat(333334))).rejects.toThrow(
+    /1,000,000|1000000/,
   )
-
-  it('rejects path traversal and unsafe segments', async () => {
-    const store = await tempStore()
-    await expect(store.read('../escape.md')).rejects.toThrow(/invalid/)
-    await expect(store.write('/absolute.md', 'x')).rejects.toThrow(/invalid/)
-    await expect(store.write('a/../b.md', 'x')).rejects.toThrow(/invalid/)
-    expect(resolveNotePath(store.root, 'ok.md')).toContain('ok.md')
-  })
-
-  it('lists empty when the store directory does not exist', async () => {
-    const store = new NotesStore(join(tmpdir(), `dsh-rollover-missing-${Date.now()}`))
-    await expect(store.list()).resolves.toEqual([])
-  })
-
-  it('renders a bounded snapshot across files', async () => {
-    const store = await tempStore()
-    await store.write('a.md', 'alpha note')
-    await store.write('b.md', 'beta note')
-    const snapshot = await store.renderAll(1000)
-    expect(snapshot).toContain('### a.md')
-    expect(snapshot).toContain('alpha note')
-    expect(snapshot).toContain('beta note')
-
-    const bounded = await store.renderAll(10)
-    expect(bounded).not.toBeNull()
-    expect(bounded?.length).toBeLessThanOrEqual(10 + '### a.md\n'.length)
-  })
-
-  it('returns null when there is nothing to render', async () => {
-    const store = await tempStore()
-    await expect(store.renderAll(1000)).resolves.toBeNull()
-  })
+  expect(await s.read('计划.md')).toBe('AB\nC')
 })
+it('resumes an oversized Unicode line without dropping its tail; queries are bounded and case sensitive', async () => {
+  const s = await store()
+  await s.write('plan/a', 'start\n' + '😀'.repeat(30) + 'TAIL\nend')
+  const first = await s.readSlice('plan/a', { start_line: 2, max_chars: 20 })
+  const second = await s.readSlice('plan/a', {
+    start_line: first.next_line!,
+    offset_chars: first.next_offset_chars!,
+    max_chars: 20,
+  })
+  expect(first.content + second.content).toBe('😀'.repeat(30) + 'TAIL\nend')
+  expect((await s.search('TAIL', { path_prefix: 'plan' })).items).toHaveLength(
+    1,
+  )
+  expect((await s.search('tail')).items).toHaveLength(0)
+  expect((await s.list({ limit: 1 })).items[0]?.bytes).toBeGreaterThan(30)
+})
+it('rejects traversal and symlinks, reports missing reads and keeps hint body-free', async () => {
+  const s = await store()
+  const other = await store()
+  await other.write('secret', 'SECRET')
+  await symlink(other.root, join(s.root, 'escape'))
+  await expect(s.read('escape/secret')).rejects.toThrow(/symbolic|symlink/)
+  await expect(s.write('../secret', 'x')).rejects.toThrow(/invalid/)
+  await expect(s.read('missing')).rejects.toThrow()
+  await s.write('safe', 'BODY_PRIVATE')
+  expect(await s.hint()).toContain('safe')
+  expect(await s.hint()).not.toContain('BODY_PRIVATE')
+})
+
+it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+  'does not overwrite an existing note when append cannot read it',
+  async () => {
+    const s = await store()
+    await s.write('state', 'preserve me')
+    const path = join(s.root, 'state')
+    await chmod(path, 0o200)
+    try {
+      await expect(s.append('state', 'extra')).rejects.toMatchObject({
+        code: 'EACCES',
+      })
+    } finally {
+      await chmod(path, 0o600)
+    }
+    expect(await readFile(path, 'utf8')).toBe('preserve me')
+  },
+)

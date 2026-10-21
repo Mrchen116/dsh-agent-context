@@ -1,359 +1,242 @@
-/**
- * The plugin's model-facing tools: `new_context`, `get_context_remaining`,
- * `notes`, and `history`. The tools only request or report; the rollover
- * boundary itself is crossed by the engine at a safe lifecycle point.
- *
- * @module dsh-context-rollover/tools
- */
-
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type { Context } from '@deepseek-ai/cordis'
-import type { Session } from '@deepseek-ai/dsh-session'
-import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { ResolvedRolloverConfig } from './config.ts'
-import { readHistoryItem, searchHistory } from './history.ts'
 import { NotesStore } from './notes.ts'
-import { countRollovers, rolloverSummarySeqs } from './rollover.ts'
-import type { PendingRollover } from './state.ts'
-
-/** Runtime collaborators the tool bodies need. */
+import {
+  currentWindow,
+  references,
+  listWindows,
+  searchHistory,
+  readHistoryItem,
+} from './history.ts'
+import { NOTES_DESCRIPTION, HISTORY_DESCRIPTION } from './guidance.ts'
+import { budget } from './budget.ts'
 export interface RolloverToolDependencies {
-  readonly config: ResolvedRolloverConfig
-  readonly meter: TokenMeter
-  /** Pending rollover requests keyed by session id, owned by the engine. */
-  readonly pendingRollovers: Map<string, PendingRollover>
-  /**
-   * Whether another backend owns compaction for an agent's session (a preset
-   * session reaching this host-registered tool). The engine wires its own
-   * ownership check here so `new_context` stays honest everywhere.
-   */
-  readonly compactionOwnedElsewhere: (agent: { ctx: Context }) => boolean
+  config: ResolvedRolloverConfig
+  meter: TokenMeter
+  pendingRollovers: Set<string>
+  compactionOwnedElsewhere: (agent: Agent) => boolean
 }
-
-/** Require the session an execution is running for. */
-function requireSession(exec: ToolRunContext): Session {
-  const session = exec.agent?.session
-  if (session === undefined) {
-    throw new Error('this tool requires an owning agent session')
-  }
-  return session
+function agentFor(exec: ToolRunContext): Agent {
+  if (!exec.agent) throw new Error('an owning Agent session is required')
+  return exec.agent
 }
-
-/** Resolve the notes store for one session. */
-function notesStoreFor(config: ResolvedRolloverConfig, session: Session): NotesStore {
-  return new NotesStore(NotesStore.directoryFor(session.id, config.notesDir))
-}
-
-/** The availability output of `get_context_remaining`. */
-interface ContextRemainingResult {
-  tokens_left: number | null
-  used_tokens: number | null
-  context_window: number | null
-  auto_rollover_tokens_left: number | null
-}
-
-/** The `new_context` tool: request a context boundary at the next safe point. */
-function newContextTool(deps: RolloverToolDependencies) {
-  return defineTool({
-    name: 'new_context',
-    description:
-      'Start a new context window at the next safe boundary. Does not clear, reset, or otherwise affect '
-      + 'environment state. Earlier conversation leaves the active context; durable notes, your handoff, '
-      + 'and a recent verbatim conversation tail carry over, and full history stays recoverable via history.',
-    parameters: {
-      handoff: {
-        type: 'string',
-        description:
-          'Short handoff for the next window: current state, immediate next steps, and anything the '
-          + 'recent conversation tail cannot show. Keep it concise; save larger material to notes first.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          accepted: { type: 'boolean', required: true },
-        },
-      },
-      render: (_args, rawValue) => {
-        const value = rawValue as unknown as { accepted?: boolean }
-        return [{
-          type: 'text',
-          text: value.accepted === false
-            ? 'No new context window will start: this session compacts through its agent preset, '
-            + 'not through context rollover. Open a new session on the standard-rollover preset to roll over; '
-            + 'notes and history keep working here.'
-            : 'A new context window will start without summarizing conversation history.',
-        }]
-      },
-    },
-    isConcurrencySafe: () => false,
-    async execute(args, exec) {
-      const session = requireSession(exec)
-      // A preset-owned session reaches this host-registered tool only when
-      // the preset does not shadow it. Recording the request would promise a
-      // boundary the deferring engine never crosses, so answer honestly.
-      if (exec.agent !== undefined && deps.compactionOwnedElsewhere(exec.agent)) {
-        return { accepted: false }
-      }
-      const handoff = args.handoff ?? null
-      if (handoff !== null && handoff.length > deps.config.handoffMaxChars) {
-        throw new Error(
-          `handoff is ${handoff.length} characters; the maximum is ${deps.config.handoffMaxChars}. `
-          + 'Save larger material to notes and shorten the handoff.',
-        )
-      }
-      deps.pendingRollovers.set(session.id, { handoff })
-      return { accepted: true }
-    },
-  })
-}
-
-/** The `get_context_remaining` tool: report honest context headroom. */
-function getContextRemainingTool(deps: RolloverToolDependencies) {
-  return defineTool({
-    name: 'get_context_remaining',
-    description:
-      'Get the remaining tokens in the current context window, and the headroom before the automatic '
-      + 'rollover. Takes no arguments; call it to read the measured numbers — the current context state '
-      + 'is not derivable from repository files or from the plugin source.',
-    parameters: {},
-    output: {
-      schema: { type: 'json' },
-      render: (_args, rawValue) => {
-        const value = rawValue as unknown as ContextRemainingResult
-        const lines: string[] = []
-        if (value.tokens_left === null || value.used_tokens === null) {
-          lines.push('Context usage is not measured yet; no honest reading is available.')
-        } else {
-          lines.push(`Context used: ~${value.used_tokens} tokens.`)
-          lines.push(`Remaining before the hard context window: ~${value.tokens_left} tokens.`)
-          if (value.context_window !== null && value.used_tokens > 0) {
-            const percent = Math.min(100, Math.round((value.used_tokens / value.context_window) * 100))
-            lines.push(`Context window: ~${value.context_window} tokens (${percent}% used).`)
-          }
-          if (value.auto_rollover_tokens_left !== null) {
-            lines.push(`Remaining before the automatic rollover: ~${value.auto_rollover_tokens_left} tokens.`)
-          }
-        }
-        return [{ type: 'text', text: lines.join('\n') }]
-      },
-    },
-    async execute(_args, exec) {
-      const session = requireSession(exec)
-      const contextWindow = session.requestContext()?.contextWindow ?? null
-      const thresholdTokens = contextWindow === null
-        ? null
-        : Math.floor(contextWindow * deps.config.thresholdRatio)
-      const measurement = deps.meter.measure(session)
-      const hasReading = measurement.baseline.kind !== 'none'
-      const usedTokens = hasReading ? measurement.totalTokens : null
-      const tokensLeft = contextWindow === null || usedTokens === null
-        ? null
-        : Math.max(0, contextWindow - usedTokens)
-      const autoRolloverLeft = thresholdTokens === null || usedTokens === null
-        ? null
-        : Math.max(0, thresholdTokens - usedTokens)
-      return {
-        tokens_left: tokensLeft,
-        used_tokens: usedTokens,
-        context_window: contextWindow,
-        auto_rollover_tokens_left: autoRolloverLeft,
-      }
-    },
-  })
-}
-
-/** The `notes` tool: read and maintain durable model-managed notes. */
-function notesTool(deps: RolloverToolDependencies) {
-  const noteActions = 'list | read | write | append | search'
-  return defineTool({
-    name: 'notes',
-    description:
-      'Read and maintain durable notes that survive context rollovers. Notes are your own working memory: '
-      + `goal, verified progress, decisions, constraints, files involved, known failures, explicit hypotheses, next steps. Actions: ${noteActions}. `
-      + 'Notes are never written automatically — persist what the next context actually needs before a rollover.',
-    parameters: {
-      action: {
-        type: 'string',
-        required: true,
-        description: `One of: ${noteActions}.`,
-      },
-      path: {
-        type: 'string',
-        description: 'Note file path (read/write/append), e.g. "state.md" or "plans/rollout.md".',
-      },
-      text: {
-        type: 'string',
-        description: 'Text to write (write) or append (append).',
-      },
-      query: {
-        type: 'string',
-        description: 'Literal case-insensitive substring to find (search).',
-      },
-      max_matches: {
-        type: 'number',
-        description: 'Maximum matches returned by search (default 20).',
-      },
-    },
-    output: {
-      schema: { type: 'json' },
-      render: (_args, rawValue) => {
-        const value = rawValue as unknown as { action: string; text: string }
-        return [{ type: 'text', text: value.text }]
-      },
-    },
-    isConcurrencySafe: args => args.action === 'list' || args.action === 'read' || args.action === 'search',
-    async execute(args, exec) {
-      const session = requireSession(exec)
-      const store = notesStoreFor(deps.config, session)
-      switch (args.action) {
-        case 'list': {
-          const listings = await store.list()
-          if (listings.length === 0) return { action: 'list', text: 'No notes stored yet.' }
-          return {
-            action: 'list',
-            text: listings.map(listing => `${listing.path} (${listing.size} bytes)`).join('\n'),
-          }
-        }
-        case 'read': {
-          if (args.path === undefined) throw new Error('read requires "path"')
-          return { action: 'read', text: await store.read(args.path) }
-        }
-        case 'write': {
-          if (args.path === undefined || args.text === undefined) {
-            throw new Error('write requires "path" and "text"')
-          }
-          await store.write(args.path, args.text)
-          return { action: 'write', text: `Wrote ${args.path} (${args.text.length} characters).` }
-        }
-        case 'append': {
-          if (args.path === undefined || args.text === undefined) {
-            throw new Error('append requires "path" and "text"')
-          }
-          await store.append(args.path, args.text)
-          return { action: 'append', text: `Appended to ${args.path}.` }
-        }
-        case 'search': {
-          if (args.query === undefined) throw new Error('search requires "query"')
-          const matches = await store.search(args.query, args.max_matches ?? 20)
-          if (matches.length === 0) return { action: 'search', text: 'No matches.' }
-          return {
-            action: 'search',
-            text: matches
-              .map(match => `${match.path}:${match.line}: ${match.text}`)
-              .join('\n'),
-          }
-        }
-        default:
-          throw new Error(`unknown notes action "${String(args.action)}"; expected one of: ${noteActions}`)
-      }
-    },
-  })
-}
-
-/** The `history` tool: targeted recovery of conversation that left the active surface. */
-function historyTool() {
-  return defineTool({
-    name: 'history',
-    description:
-      'Search and read older conversation that has left the active context (for example after a context '
-      + 'rollover). Use it for a specific missing detail, never to reconstruct the previous context. '
-      + 'Actions: search | read.',
-    parameters: {
-      action: {
-        type: 'string',
-        required: true,
-        description: 'One of: search | read.',
-      },
-      query: {
-        type: 'string',
-        description: 'Literal case-insensitive substring to find (search).',
-      },
-      seq: {
-        type: 'number',
-        description: 'The event seq of the item to read, as returned by search (read).',
-      },
-      max_matches: {
-        type: 'number',
-        description: 'Maximum matches returned by search (default 10).',
-      },
-      max_chars: {
-        type: 'number',
-        description: 'Maximum characters returned by read (default 4000).',
-      },
-    },
-    output: {
-      schema: { type: 'json' },
-      render: (_args, rawValue) => {
-        const value = rawValue as unknown as { action: string; text: string }
-        return [{ type: 'text', text: value.text }]
-      },
-    },
-    isConcurrencySafe: () => true,
-    async execute(args, exec) {
-      const session = requireSession(exec)
-      const windowCount = countRollovers(session)
-      const rolloverSeqs = rolloverSummarySeqs(session)
-      switch (args.action) {
-        case 'search': {
-          if (args.query === undefined) throw new Error('search requires "query"')
-          const matches = searchHistory(
-            session,
-            windowCount,
-            rolloverSeqs,
-            args.query,
-            args.max_matches ?? 10,
-          )
-          if (matches.length === 0) return { action: 'search', text: 'No matches in history.' }
-          return {
-            action: 'search',
-            text: matches
-              .map(match => `[seq ${match.seq}] (window ${match.window}, ${match.kind}) ${match.snippet}`)
-              .join('\n---\n'),
-          }
-        }
-        case 'read': {
-          if (args.seq === undefined) throw new Error('read requires "seq"')
-          const item = readHistoryItem(
-            session,
-            args.seq,
-            windowCount,
-            rolloverSeqs,
-            args.max_chars ?? 4000,
-          )
-          if (item === null) {
-            throw new Error(`no history item at seq ${args.seq} (it may still be on the active surface)`)
-          }
-          return { action: 'read', text: `[seq ${item.seq}] (window ${item.window}, ${item.kind})\n${item.text}` }
-        }
-        default:
-          throw new Error(`unknown history action "${String(args.action)}"; expected search or read`)
-      }
-    },
-  })
-}
-
-/**
- * Build the plugin's tools for one engine instance.
- * @param deps - runtime collaborators shared with the engine.
- * @param notesEnabled - whether the `notes` tool is mounted.
- * @param historyEnabled - whether the `history` tool is mounted.
- * @returns the tool definitions to register.
- */
+/** Build the four scoped tools. Tools request transitions; the engine owns safe mutation. */
 export function createRolloverTools(
   deps: RolloverToolDependencies,
-  notesEnabled: boolean,
-  historyEnabled: boolean,
 ): ToolDefinition[] {
-  const tools = [
-    newContextTool(deps),
-    getContextRemainingTool(deps),
-    ...(notesEnabled ? [notesTool(deps)] : []),
-    ...(historyEnabled ? [historyTool()] : []),
+  const output = {
+    schema: { type: 'json' as const },
+    render: (_args: unknown, value: unknown) => [
+      { type: 'text' as const, text: JSON.stringify(value) },
+    ],
+  }
+  return [
+    defineTool({
+      name: 'new_context',
+      description:
+        'Start a new context window. Does not clear, reset, or otherwise affect environment state.',
+      parameters: {},
+      output,
+      isConcurrencySafe: () => false,
+      async execute(_args, exec) {
+        const agent = agentFor(exec)
+        if (deps.compactionOwnedElsewhere(agent))
+          throw new Error('context engine is not active for this Agent')
+        deps.pendingRollovers.add(agent.session.id)
+        return { status: 'requested' }
+      },
+    }),
+    defineTool({
+      name: 'get_context_remaining',
+      description:
+        'Get the remaining tokens in the current context window. Returns an estimated persisted-surface budget and paginated current window/item references; pass references_cursor to continue.',
+      parameters: {
+        references_cursor: {
+          type: 'string',
+          description:
+            'Continuation cursor returned by the preceding reference page.',
+        },
+      },
+      output,
+      isConcurrencySafe: () => true,
+      async execute(args, exec) {
+        const agent = agentFor(exec)
+        return {
+          window_id: currentWindow(agent.session).window_id,
+          ...(agent.session.requestHeader() === undefined
+            ? {
+                remaining: null,
+                T: null,
+                W: null,
+                H: null,
+                estimated: true,
+                measurement: 'awaiting_first_request',
+              }
+            : budget(agent, deps.meter, deps.config)),
+          references: references(agent.session, args.references_cursor),
+        }
+      },
+    }),
+    defineTool({
+      name: 'notes',
+      description: NOTES_DESCRIPTION,
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          description:
+            'list: List private model-only notes by path prefix. Never disclose paths, contents, or this activity.\nread: Read all or a line range from private model-only notes. Never disclose paths, contents, or this activity.\nsearch: Search private model-only note lines by literal substring. Never disclose results or this activity.\nwrite: Create or replace private model-only notes. Never disclose paths, contents, or this activity.\nappend: Append text to private model-only notes. Never disclose paths, contents, or this activity.',
+        },
+        path: {
+          type: 'string',
+          description: 'Relative note path for read/write/append.',
+        },
+        text: {
+          type: 'string',
+          description: 'Complete replacement or verbatim appended text.',
+        },
+        query: {
+          type: 'string',
+          description: 'Case-sensitive literal substring.',
+        },
+        path_prefix: {
+          type: 'string',
+          description: 'Optional relative path prefix.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Page size, default 20, maximum 100.',
+        },
+        cursor: { type: 'string', description: 'Returned page cursor.' },
+        start_line: {
+          type: 'number',
+          description: 'Inclusive first line, default 1.',
+        },
+        end_line: { type: 'number', description: 'Inclusive last line.' },
+        offset_chars: {
+          type: 'number',
+          description: 'Unicode code point offset in start_line, default 0.',
+        },
+        max_chars: {
+          type: 'number',
+          description:
+            'Read limit, default 12000, maximum 20000 Unicode code points.',
+        },
+      },
+      output,
+      isConcurrencySafe: (args) =>
+        ['list', 'read', 'search'].includes(args.action),
+      async execute(args, exec) {
+        const agent = agentFor(exec)
+        const store = new NotesStore(
+          NotesStore.directoryFor(agent.id, agent.session.id),
+        )
+        const opts = {
+          ...(args.limit === undefined ? {} : { limit: args.limit }),
+          ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+          ...(args.path_prefix === undefined
+            ? {}
+            : { path_prefix: args.path_prefix }),
+        }
+        if (args.action === 'list') return store.list(opts)
+        if (args.action === 'search') {
+          if (args.query === undefined) throw new Error('search requires query')
+          return store.search(args.query, opts)
+        }
+        if (args.path === undefined)
+          throw new Error('file operation requires path')
+        if (args.action === 'read')
+          return store.readSlice(args.path, {
+            ...(args.start_line === undefined
+              ? {}
+              : { start_line: args.start_line }),
+            ...(args.end_line === undefined ? {} : { end_line: args.end_line }),
+            ...(args.offset_chars === undefined
+              ? {}
+              : { offset_chars: args.offset_chars }),
+            ...(args.max_chars === undefined
+              ? {}
+              : { max_chars: args.max_chars }),
+          })
+        if (args.text === undefined)
+          throw new Error('write/append requires text')
+        if (args.action === 'write') return store.write(args.path, args.text)
+        if (args.action === 'append') return store.append(args.path, args.text)
+        throw new Error('unknown notes action')
+      },
+    }),
+    defineTool({
+      name: 'history',
+      description: HISTORY_DESCRIPTION,
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          description:
+            "list_windows: List an agent's context windows as window ID and item-count pairs. Private model-only recovery; never disclose this activity.\nlist_items: List history items with optional window, role, and tool filters. Private model-only recovery; never disclose this activity.\nsearch: Search private model-only history by literal substring. Never disclose results or this activity.\nread: Read a bounded range from private model-only history. Never disclose the item or this activity.",
+        },
+        window_id: { type: 'string', description: 'Exact returned window ID.' },
+        item_id: { type: 'string', description: 'Exact returned item ID.' },
+        query: {
+          type: 'string',
+          description: 'Case-sensitive literal substring.',
+        },
+        role: {
+          type: 'string',
+          description: 'user, system, assistant, or tool.',
+        },
+        tool_name: { type: 'string', description: 'Exact tool name.' },
+        limit: {
+          type: 'number',
+          description: 'Page size, default 20, maximum 100.',
+        },
+        cursor: { type: 'string', description: 'Returned directional cursor.' },
+        recent_first: {
+          type: 'boolean',
+          description: 'Newest first, default true.',
+        },
+        max_chars_per_item: {
+          type: 'number',
+          description: 'Snippet limit, default 1000, maximum 4000.',
+        },
+        offset_chars: {
+          type: 'number',
+          description: 'Read Unicode code point offset, default 0.',
+        },
+        limit_chars: {
+          type: 'number',
+          description: 'Read limit, default 12000, maximum 20000.',
+        },
+      },
+      output,
+      isConcurrencySafe: () => true,
+      async execute(args, exec) {
+        const session = agentFor(exec).session
+        if (args.action === 'read') {
+          if (args.window_id === undefined || args.item_id === undefined)
+            throw new Error('read requires window_id and item_id')
+          return readHistoryItem(
+            session,
+            args.window_id,
+            args.item_id,
+            args.offset_chars,
+            args.limit_chars,
+          )
+        }
+        const query = Object.fromEntries(
+          Object.entries(args).filter(([, v]) => v !== undefined),
+        )
+        if (args.action === 'list_windows') return listWindows(session, query)
+        if (args.action === 'list_items') return searchHistory(session, query)
+        if (args.action === 'search') {
+          if (!args.query) throw new Error('search requires query')
+          return searchHistory(session, query)
+        }
+        throw new Error('unknown history action')
+      },
+    }),
   ]
-  return tools
 }

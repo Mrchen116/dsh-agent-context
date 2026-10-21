@@ -1,124 +1,122 @@
-/**
- * Tool rendering tests: every `notes` and `history` branch returns the stable
- * `{ action, text }` shape the renderer reads, verified through the actual DSH
- * tool runtime (execute + render), not only the underlying stores — so the
- * assertions cover the final model-visible content.
- *
- * @module tests/tools.spec
- */
-
-import { describe, expect, it } from 'vitest'
+import { expect, it } from 'vitest'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import { countRollovers } from '../src/rollover.ts'
 import {
   engineHarness,
   followup,
   ScriptedAdapter,
-  seedExchanges,
   textResponse,
 } from './harness.ts'
-
-/** Execute one tool through the registry and require success. */
-async function executeTool(
+async function run(
   ctx: Context,
   agent: Agent,
   name: string,
   args: Record<string, unknown>,
-  callId: string,
 ) {
   const result = await ctx.tools.execute({
     signal: new AbortController().signal,
-    callId: ToolCallId(callId),
+    callId: ToolCallId('test'),
     name,
     arguments: args,
     agent,
   })
-  if (result.isError) throw new Error(`tool ${name} failed: ${JSON.stringify(result.content)}`)
-  return result
+  if (result.isError) throw new Error(JSON.stringify(result.content))
+  return JSON.parse(
+    result.content.map((b) => (b.type === 'text' ? b.text : '')).join(''),
+  )
 }
-
-/** The final model-visible text of a successful tool result. */
-function renderedText(result: { content: readonly { type: string; text?: string }[] }): string {
-  return result.content
-    .map(block => block.type === 'text' ? block.text ?? '' : `[${block.type}]`)
-    .join('\n')
-}
-
-describe('notes tool rendering', () => {
-  it('renders write, append, read, and a non-empty list', async () => {
-    const { ctx, agent } = await engineHarness('tools-notes-list')
-    await executeTool(ctx, agent, 'notes', { action: 'write', path: 'state.md', text: 'goal: prove rendering' }, 'n1')
-    await executeTool(ctx, agent, 'notes', { action: 'append', path: 'state.md', text: 'next: tests' }, 'n2')
-    await executeTool(ctx, agent, 'notes', { action: 'write', path: 'plans/rollout.md', text: 'step 1' }, 'n3')
-
-    const read = await executeTool(ctx, agent, 'notes', { action: 'read', path: 'state.md' }, 'n4')
-    expect(renderedText(read)).toContain('goal: prove rendering')
-    expect(renderedText(read)).toContain('next: tests')
-
-    const list = await executeTool(ctx, agent, 'notes', { action: 'list' }, 'n5')
-    const listText = renderedText(list)
-    expect(listText).toContain('state.md')
-    expect(listText).toContain('plans/rollout.md')
-    expect(listText).not.toContain('undefined')
-    expect(list.value).toMatchObject({ action: 'list' })
-    expect((list.value as { text?: unknown }).text).toContain('state.md')
+it('renders complete paginated notes and archive recovery through the public tool runtime', async () => {
+  const { ctx, agent, engine } = await engineHarness('tools', {
+    bufferTokens: 10000,
+    models: { 'mock:mock': { bufferTokens: 12000, reminderTokens: 5000 } },
   })
-
-  it('renders search hits', async () => {
-    const { ctx, agent } = await engineHarness('tools-notes-search')
-    await executeTool(ctx, agent, 'notes', { action: 'write', path: 'state.md', text: 'decided: no summary' }, 's1')
-
-    const search = await executeTool(ctx, agent, 'notes', { action: 'search', query: 'SUMMARY' }, 's2')
-    const searchText = renderedText(search)
-    expect(searchText).toContain('state.md')
-    expect(searchText).toContain('decided: no summary')
-    expect(searchText).not.toContain('undefined')
+  expect(await run(ctx, agent, 'get_context_remaining', {})).toMatchObject({
+    remaining: null,
+    measurement: 'awaiting_first_request',
   })
+  await run(ctx, agent, 'notes', {
+    action: 'write',
+    path: 'state',
+    text: 'hello',
+  })
+  await run(ctx, agent, 'notes', {
+    action: 'append',
+    path: 'state',
+    text: ' world',
+  })
+  expect(
+    await run(ctx, agent, 'notes', { action: 'read', path: 'state' }),
+  ).toMatchObject({ content: 'hello world', truncated: false })
+  expect(
+    (await run(ctx, agent, 'notes', { action: 'list' })).items[0],
+  ).toMatchObject({ path: 'state', bytes: 11 })
+  expect(
+    (await run(ctx, agent, 'notes', { action: 'search', query: 'world' }))
+      .items[0],
+  ).toMatchObject({ line: 1, path: 'state' })
+  const adapter = new ScriptedAdapter([
+    textResponse('long evidence '.repeat(1000)),
+  ])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'original requirement')
+  const reading = await run(ctx, agent, 'get_context_remaining', {})
+  expect(reading).toMatchObject({
+    O: 10000,
+    C: 100000,
+    H: 90000,
+    W: 78000,
+    B: 12000,
+    R: 5000,
+    estimated: true,
+    measurement: 'persisted-surface',
+  })
+  expect(reading.remaining).toBe(Math.max(0, reading.W - reading.T))
+  expect(
+    reading.references.items.some((i: { preview: string }) =>
+      i.preview.includes('original requirement'),
+    ),
+  ).toBe(true)
+  await engine.compactNow(agent, new AbortController().signal)
+  const found = await run(ctx, agent, 'history', {
+    action: 'search',
+    query: 'original requirement',
+  })
+  expect(found.items).toHaveLength(1)
+  const item = found.items[0]
+  expect(
+    await run(ctx, agent, 'history', {
+      action: 'read',
+      window_id: item.window_id,
+      item_id: item.item_id,
+    }),
+  ).toMatchObject({ content: 'original requirement' })
+  expect(
+    (await run(ctx, agent, 'history', { action: 'list_windows' })).items,
+  ).toHaveLength(1)
 })
-
-describe('history tool rendering', () => {
-  it('renders search hits from earlier windows', async () => {
-    const { ctx, engine, agent, session } = await engineHarness('tools-history-search')
-    const adapter = new ScriptedAdapter(
-      Array.from({ length: 30 }, (_unused, index) => textResponse(`background detail ${index}`)),
-    )
-    ctx.llm.registerAdapter(['mock'], adapter)
-
-    await seedExchanges(agent, 20)
-    await followup(agent, 'orchard harvest plan')
-    const compacted = await engine.compactNow(agent, new AbortController().signal)
-    expect(compacted).not.toBeNull()
-    expect(countRollovers(session)).toBe(1)
-
-    const search = await executeTool(ctx, agent, 'history', { action: 'search', query: 'research question 0' }, 'h1')
-    const searchText = renderedText(search)
-    expect(searchText).toContain('research question 0')
-    expect(searchText).toContain('[seq ')
-    expect(searchText).not.toContain('undefined')
+it('does not allow another session to address notes or historical references', async () => {
+  const first = await engineHarness('one')
+  await run(first.ctx, first.agent, 'notes', {
+    action: 'write',
+    path: 'private',
+    text: 'secret',
   })
-
-  it('renders a full read of a shadowed item', async () => {
-    const { ctx, engine, agent } = await engineHarness('tools-history-read')
-    const adapter = new ScriptedAdapter(
-      Array.from({ length: 30 }, (_unused, index) => textResponse(`background detail ${index}`)),
-    )
-    ctx.llm.registerAdapter(['mock'], adapter)
-
-    await seedExchanges(agent, 20)
-    await followup(agent, 'orchard harvest plan')
-    const compacted = await engine.compactNow(agent, new AbortController().signal)
-    expect(compacted).not.toBeNull()
-
-    const search = await executeTool(ctx, agent, 'history', { action: 'search', query: 'research question 1' }, 'h1')
-    const seqMatch = /\[seq (\d+)\]/.exec(renderedText(search))
-    if (seqMatch?.[1] === undefined) throw new Error('expected a history search hit with a seq')
-    const read = await executeTool(ctx, agent, 'history', { action: 'read', seq: Number(seqMatch[1]) }, 'h2')
-    const readText = renderedText(read)
-    expect(readText).toContain('research question 1')
-    expect(readText).toContain('[seq ')
-    expect(readText).not.toContain('undefined')
-    expect(read.value).toMatchObject({ action: 'read' })
-  })
+  const second = await engineHarness('two')
+  expect(
+    (await run(second.ctx, second.agent, 'notes', { action: 'list' })).items,
+  ).toEqual([])
+  await expect(
+    run(second.ctx, second.agent, 'notes', {
+      action: 'read',
+      path: '../one/notes/private',
+    }),
+  ).rejects.toThrow(/invalid/)
+  await expect(
+    run(second.ctx, second.agent, 'history', {
+      action: 'read',
+      window_id: 'one:initial',
+      item_id: '1',
+    }),
+  ).rejects.toThrow(/not_found/)
 })

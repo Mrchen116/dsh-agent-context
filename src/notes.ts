@@ -1,205 +1,242 @@
-/**
- * Durable model-managed notes: plain markdown files under one per-session
- * directory, surviving context rollovers within the session. Notes are the
- * model's own selected state — nothing is written automatically.
- *
- * A file store (not session events) keeps every log readable by any DSH
- * build: `Session.append` cannot mark a plugin's custom event types
- * `ignorable`, so unknown plugin events on a session log would make that log
- * refused at restore.
- *
- * @module dsh-context-rollover/notes
- */
-
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import {
+  mkdir,
+  readdir,
+  readFile,
+  lstat,
+  rename,
+  writeFile,
+  rm,
+} from 'node:fs/promises'
+import { dirname, join, isAbsolute } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
-/** Reject path traversal and unsafe note path components. */
-const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._ -]*$/
+const MAX_BYTES = 1_000_000
+const writes = new Map<string, Promise<unknown>>()
+export interface PageOptions {
+  path_prefix?: string
+  limit?: number
+  cursor?: string
+}
+export interface ReadOptions {
+  start_line?: number
+  end_line?: number
+  offset_chars?: number
+  max_chars?: number
+}
+export type NoteListing = { path: string; bytes: number; mtime: number }
 
-/**
- * Validate a model-supplied note path and map it into the store directory.
- * @param dir - the store's root directory.
- * @param path - relative note path (`foo.md`, `plans/rollout.md`).
- * @returns the absolute file path.
- * @throws when the path escapes the store (traversal, absolute, empty segments).
- */
+/** Validate a session-relative note path without expanding shell syntax. */
 export function resolveNotePath(dir: string, path: string): string {
-  if (path.length === 0) throw new Error('note path must not be empty')
-  const segments = path.split('/')
-  for (const segment of segments) {
-    if (segment.length === 0 || segment === '.' || segment === '..' || !SAFE_SEGMENT.test(segment)) {
-      throw new Error(
-        `note path "${path}" is invalid: segments must be relative and match ${SAFE_SEGMENT.source}`,
-      )
-    }
+  if (
+    isAbsolute(path) ||
+    path.includes('\\') ||
+    path.includes('\0') ||
+    path.split('/').some((p) => !p || p === '.' || p === '..')
+  ) {
+    throw new Error(`invalid note path: ${path}`)
   }
-  return join(dir, ...segments)
+  return join(dir, path)
+}
+export function boundedInteger(
+  value: number | undefined,
+  fallback: number,
+  max: number,
+  min = 1,
+): number {
+  const n = value ?? fallback
+  if (!Number.isSafeInteger(n) || n < min || n > max)
+    throw new Error(`expected integer in [${min}, ${max}]`)
+  return n
+}
+function page<T>(items: T[], options: PageOptions) {
+  const limit = boundedInteger(options.limit, 20, 100)
+  const start = options.cursor === undefined ? 0 : Number(options.cursor)
+  boundedInteger(start, 0, Number.MAX_SAFE_INTEGER, 0)
+  return {
+    items: items.slice(start, start + limit),
+    next_cursor: start + limit < items.length ? String(start + limit) : null,
+  }
 }
 
-/** One listed note file. */
-export interface NoteListing {
-  /** Store-relative path. */
-  readonly path: string
-  readonly size: number
-  readonly updatedAt: number
-}
-
-/** One literal note search hit. */
-export interface NoteMatch {
-  readonly path: string
-  /** 1-based line number. */
-  readonly line: number
-  /** The matched line text. */
-  readonly text: string
-}
-
-/** Per-session durable notes store over plain markdown files. */
+/** Durable files owned by exactly one Agent session; successful writes are immediately visible. */
 export class NotesStore {
-  constructor(private readonly dir: string) {}
-
-  /** The store's root directory. */
-  get root(): string {
-    return this.dir
+  constructor(readonly root: string) {}
+  /** Resolve the host-provided DSH home namespace; IDs are path segments, never paths. */
+  static directoryFor(agentId: string, sessionId: string): string {
+    return dshHomePath(
+      'agent-context',
+      encodeURIComponent(agentId),
+      encodeURIComponent(sessionId),
+      'notes',
+    )
   }
-
-  /**
-   * Resolve the default store directory for one session: `<notesDir>/<id>`
-   * under the configured base, defaulting to `<dsh home>/notes/<id>`.
-   * @param sessionId - the owning session's id.
-   * @param baseDir - configured base directory override, when any.
-   * @returns the store directory.
-   */
-  static directoryFor(sessionId: string, baseDir?: string): string {
-    return join(baseDir ?? dshHomePath('notes'), sessionId)
-  }
-
-  /**
-   * List note files newest-modified first.
-   * @returns the listings, or `[]` when the store directory does not exist.
-   */
-  async list(): Promise<NoteListing[]> {
-    let entries: string[]
-    try {
-      entries = await readdir(this.dir, { recursive: true })
-    } catch {
-      return []
+  private async checked(path: string): Promise<string> {
+    const absolute = resolveNotePath(this.root, path)
+    // Refuse symlinks at every level, including the namespace root. This is a
+    // file API boundary, not a sandbox against concurrent hostile host code.
+    let current = this.root
+    for (const part of ['', ...path.split('/')]) {
+      if (part) current = join(current, part)
+      try {
+        if ((await lstat(current)).isSymbolicLink())
+          throw new Error(`symbolic link is not a note path: ${path}`)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
     }
-    const listings = await Promise.all(entries.map(async (entry) => {
-      const path = entry.replaceAll('\\', '/')
-      const absolute = join(this.dir, entry)
-      const info = await stat(absolute).catch(() => undefined)
-      if (info === undefined || !info.isFile()) return undefined
-      return { path, size: info.size, updatedAt: info.mtimeMs }
-    }))
-    return listings
-      .filter((listing): listing is NoteListing => listing !== undefined)
-      .sort((a, b) => b.updatedAt - a.updatedAt)
+    return absolute
   }
-
-  /**
-   * Read one note file's full text.
-   * @param path - store-relative note path.
-   * @returns the file text.
-   */
+  private async listings(prefix = ''): Promise<NoteListing[]> {
+    if (prefix) resolveNotePath(this.root, prefix)
+    const out: NoteListing[] = []
+    const walk = async (relative: string): Promise<void> => {
+      let entries
+      try {
+        entries = await readdir(
+          relative ? await this.checked(relative) : this.root,
+          { withFileTypes: true },
+        )
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+        throw error
+      }
+      for (const entry of entries) {
+        const path = relative ? `${relative}/${entry.name}` : entry.name
+        if (entry.isSymbolicLink()) continue
+        if (entry.isDirectory()) await walk(path)
+        else if (entry.isFile() && path.startsWith(prefix)) {
+          const info = await lstat(await this.checked(path))
+          out.push({ path, bytes: info.size, mtime: info.mtimeMs })
+        }
+      }
+    }
+    await this.checked('namespace-check')
+    await walk('')
+    return out.sort(
+      (a, b) =>
+        b.mtime - a.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+    )
+  }
+  /** List a bounded page, newest modified files first, with a stable path tie-break. */
+  async list(options: PageOptions = {}) {
+    return page(await this.listings(options.path_prefix), options)
+  }
+  /** Read raw content for local store operations. Model callers use readSlice. */
   async read(path: string): Promise<string> {
-    return readFile(resolveNotePath(this.dir, path), 'utf8')
+    return readFile(await this.checked(path), 'utf8')
   }
-
-  /**
-   * Create or replace one note file, creating parent directories.
-   * @param path - store-relative note path.
-   * @param text - complete replacement text.
-   */
-  async write(path: string, text: string): Promise<void> {
-    const absolute = resolveNotePath(this.dir, path)
-    await mkdir(join(absolute, '..'), { recursive: true })
-    await writeFile(absolute, text, 'utf8')
+  /** Read an inclusive line range, continuing oversized lines with Unicode code point offsets. */
+  async readSlice(path: string, options: ReadOptions = {}) {
+    const lines = (await this.read(path)).split('\n')
+    const start = boundedInteger(options.start_line, 1, lines.length)
+    const end = boundedInteger(options.end_line, lines.length, lines.length)
+    if (end < start) throw new Error('invalid line range: end precedes start')
+    const offset = boundedInteger(
+      options.offset_chars,
+      0,
+      Array.from(lines[start - 1]!).length,
+      0,
+    )
+    const max = boundedInteger(options.max_chars, 12000, 20000)
+    const content = Array.from(lines.slice(start - 1, end).join('\n')).slice(
+      offset,
+    )
+    const chunk = content.slice(0, max).join('')
+    const consumed = chunk.split('\n')
+    const nextLine = start + consumed.length - 1
+    const nextOffset =
+      consumed.length === 1
+        ? offset + Array.from(chunk).length
+        : Array.from(consumed.at(-1)!).length
+    const truncated = content.length > max
+    return {
+      path,
+      content: chunk,
+      truncated,
+      next_line: truncated ? nextLine : null,
+      next_offset_chars: truncated ? nextOffset : null,
+    }
   }
-
-  /**
-   * Append text to one note file, creating it when missing. Appends always
-   * end with a newline so successive appends stay line-oriented.
-   *
-   * Only a missing file counts as "start from empty". Every other read failure
-   * (EACCES, EISDIR, EIO, a symlink loop) is re-thrown, because the write below
-   * replaces the whole file: treating an unreadable note as an empty one would
-   * destroy its contents and still report success.
-   *
-   * @param path - store-relative note path.
-   * @param text - text to append exactly as provided.
-   * @throws when the existing note cannot be read for any reason but absence.
-   */
-  async append(path: string, text: string): Promise<void> {
-    const absolute = resolveNotePath(this.dir, path)
-    let current = ''
+  private async update(path: string, text: string, append: boolean) {
+    const key = resolveNotePath(this.root, path)
+    const previous = writes.get(key) ?? Promise.resolve()
+    const operation = previous
+      .catch(() => {})
+      .then(async () => {
+        const absolute = await this.checked(path)
+        let existing = ''
+        if (append) {
+          try {
+            existing = await readFile(absolute, 'utf8')
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          }
+        }
+        const content = existing + text
+        const bytes = Buffer.byteLength(content)
+        if (bytes > MAX_BYTES)
+          throw new Error(
+            'note exceeds 1,000,000 UTF-8 bytes; write another file',
+          )
+        await mkdir(dirname(absolute), { recursive: true })
+        await this.checked(path)
+        const temporary = `${absolute}.${randomUUID()}.tmp`
+        try {
+          await writeFile(temporary, content, { encoding: 'utf8', flag: 'wx' })
+          await rename(temporary, absolute)
+        } finally {
+          await rm(temporary, { force: true })
+        }
+        return { path, bytes }
+      })
+    writes.set(key, operation)
     try {
-      current = await readFile(absolute, 'utf8')
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      return await operation
+    } finally {
+      if (writes.get(key) === operation) writes.delete(key)
     }
-    const separator = current.length > 0 && !current.endsWith('\n') ? '\n' : ''
-    await mkdir(join(absolute, '..'), { recursive: true })
-    await writeFile(absolute, `${current}${separator}${text}\n`, 'utf8')
   }
-
-  /**
-   * Literal case-insensitive search over note lines.
-   * @param query - literal substring to find.
-   * @param maxMatches - upper bound on returned matches.
-   * @returns the matches in file order.
-   */
-  async search(query: string, maxMatches = 20): Promise<NoteMatch[]> {
-    const lowerQuery = query.toLowerCase()
-    if (lowerQuery.length === 0) return []
-    const matches: NoteMatch[] = []
-    for (const listing of await this.list()) {
-      if (matches.length >= maxMatches) break
-      let text: string
-      try {
-        text = await this.read(listing.path)
-      } catch {
-        continue
-      }
-      const lines = text.split('\n')
-      for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index]
-        if (line === undefined || !line.toLowerCase().includes(lowerQuery)) continue
-        matches.push({ path: listing.path, line: index + 1, text: line })
-        if (matches.length >= maxMatches) break
-      }
-    }
-    return matches
+  /** Atomically replace one note within the byte limit. */
+  write(path: string, text: string) {
+    return this.update(path, text, false)
   }
-
-  /**
-   * Render every note file into one bounded text snapshot for a rollover
-   * checkpoint. `maxChars` bounds the whole snapshot (headers included);
-   * note bodies are filled newest-modified first.
-   * @param maxChars - hard character bound for the snapshot.
-   * @returns the snapshot, or `null` when the store is empty.
-   */
-  async renderAll(maxChars: number): Promise<string | null> {
-    const listings = await this.list()
-    if (listings.length === 0) return null
-    const sections: string[] = []
-    let length = 0
-    for (const listing of listings) {
-      let text: string
-      try {
-        text = await this.read(listing.path)
-      } catch {
-        continue
+  /** Append text verbatim, serializing mutations of the same file. */
+  append(path: string, text: string) {
+    return this.update(path, text, true)
+  }
+  /** Search literal, case-sensitive text and return bounded line snippets. */
+  async search(query: string, options: PageOptions = {}) {
+    if (!query) throw new Error('search requires a nonempty query')
+    const matches: { path: string; line: number; content: string }[] = []
+    for (const listing of await this.listings(options.path_prefix)) {
+      const lines = (await this.read(listing.path)).split('\n')
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!
+        const index = line.indexOf(query)
+        if (index < 0) continue
+        const offset = Array.from(line.slice(0, index)).length
+        matches.push({
+          path: listing.path,
+          line: i + 1,
+          content: Array.from(line)
+            .slice(Math.max(0, offset - 80), offset + 240)
+            .join(''),
+        })
       }
-      const header = `### ${listing.path}\n`
-      const remaining = maxChars - length - header.length
-      if (remaining <= 0) break
-      const body = text.length > remaining ? text.slice(0, remaining) : text
-      length += header.length + body.length
-      sections.push(`${header}${body}`)
     }
-    if (sections.length === 0) return null
-    return sections.join('\n\n')
+    return page(matches, options)
+  }
+  /** Navigation only: never inject note bodies into a new window. */
+  async hint(): Promise<string> {
+    const paths: string[] = []
+    for (const file of (await this.listings()).slice(0, 5)) {
+      const candidate = `<recent_notes>\n${[...paths, JSON.stringify(file.path)].join('\n')}\n</recent_notes>`
+      if (Buffer.byteLength(candidate) > 4000) break
+      paths.push(JSON.stringify(file.path))
+    }
+    return paths.length
+      ? `<recent_notes>\n${paths.join('\n')}\n</recent_notes>`
+      : ''
   }
 }
