@@ -81,10 +81,4 @@ shasum -a 256 dsh-agent-context-0.3.0-rc.1.tgz
 The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
 
 
-### Interrupted work recovery
-
-History items expose `turn_id`, the owning native `turn/start` event sequence as an opaque string (or null outside a turn). `history` actions `list_items` and `search` accept an exact `turn_id` filter across archived windows of the current session.
-
-When a reset removes messages from the currently open turn, its durable checkpoint includes a body-free `<interrupted_turn>` with bounded item references and a paginated History query. The model must recover original inputs and prior deliveries before continuing or concluding: existing Notes may predate a newly read Inbox task. An idle manual reset does not invent interrupted work. Runtime environment reconstruction remains in the native compaction transaction; only window identity changes its ordinary context contribution.
-
-These on-demand reference and interrupted-turn instructions adapt the Codex baseline for DSH's cumulative runtime snapshots. Golden fixtures retain the original text and record the changed adaptation; they do not claim that this recovery protocol is verbatim upstream Codex behavior.
+Only window identity changes the ordinary runtime context contribution. Notes hints appear when a window is constructed; Skill catalogs belong to the host. Prior content is recovered through the original Notes and window/item History tools, without a separate current-turn recovery protocol.

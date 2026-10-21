@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-context",
   "description": "Session-scoped notes, archived history and deterministic context windows for DSH.",
-  "version": "0.3.0-rc.2",
+  "version": "0.3.0-rc.3",
   "type": "module",
   "license": "MIT",
   "repository": {

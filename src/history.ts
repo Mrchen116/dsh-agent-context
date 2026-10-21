@@ -8,7 +8,6 @@ export interface WindowInfo {
   end_seq: number
 }
 export interface HistoryItem {
-  turn_id: string | null
   window_id: string
   item_id: string
   ordinal: number
@@ -20,7 +19,6 @@ export interface HistoryItem {
   content: string
 }
 export interface HistoryQuery {
-  turn_id?: string
   window_id?: string
   role?: string
   tool_name?: string
@@ -82,10 +80,7 @@ export function normalizedItems(session: Session): HistoryItem[] {
   const boundaries = windows(session)
   const calls = new Map<string, string>()
   const items: HistoryItem[] = []
-  let turnId: string | null = null
   for (const event of session.snapshotEvents()) {
-    if (event.type === 'turn/start') turnId = String(event.seq)
-    if (event.type === 'turn/end') turnId = null
     if (excluded(event)) continue
     const message =
       event.type === 'user/message'
@@ -129,7 +124,6 @@ export function normalizedItems(session: Session): HistoryItem[] {
         ? `${blocks}\n${JSON.stringify({ ...event.data, message: { ...event.data.message, content: undefined } })}`
         : blocks
     items.push({
-      turn_id: turnId,
       window_id: window.window_id,
       item_id: String(event.seq),
       ordinal: window.ordinal,
@@ -181,7 +175,6 @@ export function searchHistory(session: Session, query: HistoryQuery = {}) {
   const filtered = collectHistory(session).filter(
     (item) =>
       (query.window_id === undefined || item.window_id === query.window_id) &&
-      (query.turn_id === undefined || item.turn_id === query.turn_id) &&
       (query.role === undefined || item.role === query.role) &&
       (query.tool_name === undefined ||
         item.tool_names.includes(query.tool_name)) &&
@@ -303,37 +296,4 @@ export function references(session: Session, cursor?: string) {
 }
 export function referenceText(session: Session): string {
   return `<context_references>\n${JSON.stringify(references(session))}\n</context_references>`
-}
-
-/** Locate archived work from the open execution turn without copying its body. */
-export function interruptedTurn(session: Session, shadowedSeqs: readonly number[]) {
-  let turnId: string | null = null
-  for (const event of session.snapshotEvents()) {
-    if (event.type === 'turn/start') turnId = String(event.seq)
-    if (event.type === 'turn/end') turnId = null
-  }
-  if (turnId === null) return undefined
-  const shadowed = new Set(shadowedSeqs)
-  const items = normalizedItems(session).filter(item => item.turn_id === turnId && shadowed.has(item.seq))
-  if (!items.length) return undefined
-  const refs = [items[0]!, ...items.slice(Math.max(1, items.length - 4))].map(item => ({
-    window_id: item.window_id,
-    item_id: item.item_id,
-    role: item.role,
-    source: item.source?.kind ?? null,
-    tool_names: item.tool_names,
-  }))
-  const navigation = {
-    turn_id: turnId,
-    item_count: items.length,
-    first_item_id: items[0]!.item_id,
-    last_item_id: items.at(-1)!.item_id,
-    references: [] as typeof refs,
-    history: { action: 'list_items', turn_id: turnId, limit: 20, recent_first: false },
-  }
-  for (const ref of refs) {
-    navigation.references.push(ref)
-    if (Buffer.byteLength(JSON.stringify(navigation)) > 4000) navigation.references.pop()
-  }
-  return navigation
 }

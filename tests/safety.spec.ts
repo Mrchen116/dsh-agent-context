@@ -104,7 +104,7 @@ it('manual reset uses the idle lease and rejects a non-shrinking context', async
   expect(countRollovers(session)).toBe(1)
 })
 
-it.each(['pressure', 'overflow'] as const)('locates already consumed Inbox work after %s reset with stale Notes and default budgets', async reason => {
+it.each(['pressure', 'overflow'] as const)('keeps consumed Inbox work retrievable without automatic task replay after %s reset', async reason => {
   const { ctx, agent, session } = await engineHarness(`inbox-${reason}`, {}, { maxTokens: 32768 })
   await new NotesStore(NotesStore.directoryFor(agent.id, session.id)).write('checkpoint.md', 'Old greeting completed. No new work.')
   ctx.tools.register(defineTool({
@@ -137,18 +137,15 @@ it.each(['pressure', 'overflow'] as const)('locates already consumed Inbox work 
   expect(countRollovers(session)).toBe(1)
   const request = adapter.requests.at(-1)!.flatMap(message => message.content
     .filter(block => block.type === 'text').map(block => block.text)).join('\n')
-  const recovery = /<interrupted_turn>\s*([^]*?)\s*<\/interrupted_turn>/.exec(request)
-  expect(recovery, request.slice(0, 1000)).not.toBeNull()
-  const navigation = JSON.parse(recovery![1]!)
-  const turn = session.snapshotEvents().filter(event => event.type === 'turn/start').at(-1)!
-  expect(navigation.turn_id).toBe(String(turn.seq))
+  expect(request).not.toContain('<interrupted_turn>')
   expect(request).not.toContain('LATEST_TASK_629') // Raw task bodies still require History.
   expect(request).not.toContain('Old greeting completed.')
   const restored = Session.create(session.id, session.snapshotEvents())
-  const page = searchHistory(restored, { ...navigation.history, role: 'tool', tool_name: 'inbox' })
+  const page = searchHistory(restored, { role: 'tool', tool_name: 'inbox' })
   expect(page.items).toHaveLength(1)
-  expect(page.items[0]).toMatchObject({ role: 'tool', turn_id: String(turn.seq) })
+  expect(page.items[0]).toMatchObject({ role: 'tool' })
+  expect(page.items[0]).not.toHaveProperty('turn_id')
   expect(page.items[0]!.content).toContain('LATEST_TASK_629')
   expect(page.items[0]!.content).toContain('new-message-629')
-  expect(searchHistory(restored, { ...navigation.history, role: 'user' }).items.map(item => item.content)).toEqual(['System wake: check your inbox'])
+  expect(searchHistory(restored, { role: 'user', query: 'System wake' }).items.map(item => item.content)).toEqual(['System wake: check your inbox'])
 })

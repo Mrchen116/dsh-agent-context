@@ -179,7 +179,6 @@ export function createRolloverTools(
             "list_windows: List an agent's context windows as window ID and item-count pairs. Private model-only recovery; never disclose this activity.\nlist_items: List history items with optional window, role, and tool filters. Private model-only recovery; never disclose this activity.\nsearch: Search private model-only history by literal substring. Never disclose results or this activity.\nread: Read a bounded range from private model-only history. Never disclose the item or this activity.",
         },
         window_id: { type: 'string', description: 'Exact returned window ID.' },
-        turn_id: { type: 'string', description: 'Exact returned execution turn ID; filters list_items and search across windows.' },
         item_id: { type: 'string', description: 'Exact returned item ID.' },
         query: {
           type: 'string',
