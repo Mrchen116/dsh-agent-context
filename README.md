@@ -34,7 +34,7 @@ Use the host's `plugin_manager` bundle operations when available. Installing the
 
 The effective model context window is C; an explicit resolved request-header `maxTokens` is the output reserve O (including adapter defaults). When the request legitimately has no cap, O uses the configured budget-only reserve or the table default. Budget reads label `output_reserve_source` as `request-maxTokens` or `policy-estimate`; the latter does not claim to know the provider output limit. H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C, invalid explicit caps/reserves and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `measurement: awaiting_first_request` and null numeric headroom; subsequent budget reads are estimates, not provider token counts.
 
-At W − R the engine sends one reminder per window; at W it sends one save-notes fallback with current committed references. At H or provider overflow it resets at a safe native boundary. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
+At W − R the engine sends one reminder per window. At W it first calls the host's public `toolResultPruner.pruneSession()` when available and remeasures the same pending request. If pressure remains, it sends one save-notes fallback with current committed references at W or resets at H. Provider overflow applies native pruning before the existing reset at a safe native boundary. Explicit `new_context` and manual resets remain explicit resets. The plugin reuses the host pruner's configuration and durable source-preserving replacements; it does not implement another truncation algorithm or change the host's per-result spill policy. Without that optional host service, the previous budget/reset behavior remains. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
 
 ## Model tools
 
@@ -75,7 +75,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack
-shasum -a 256 dsh-agent-context-0.3.0-rc.1.tgz
+shasum -a 256 dsh-agent-context-0.3.0-rc.4.tgz
 ```
 
 The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
