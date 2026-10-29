@@ -63,6 +63,29 @@ History preserves original provenance, full tool arguments and persisted result 
 
 List/search accept `window_id`, `role`, `tool_name`, `recent_first` (true), `limit` (20, maximum 100), and a directional `cursor`. Item snippets use `max_chars_per_item` (1000, maximum 4000). `read` requires `window_id` and `item_id`, with `offset_chars` (0) and `limit_chars` (12000, maximum 20000), returning `total_chars`, `next_offset_chars`, and `truncated`.
 
+Hosts can query an authorized immutable event snapshot through the package root export:
+
+```ts
+import { createHistoryView } from 'dsh-agent-context'
+
+const view = createHistoryView(sessionId, authorizedEvents)
+view.listWindows({ limit: 20 })
+view.search({ role: 'user', query: 'literal text' }) // omit query to list items
+view.read(windowId, itemId, 0, 12000)
+```
+
+The view includes supplied active and archived records and shares normalization, filtering,
+window identity, directional cursors and Unicode slicing with ordinary History. It retains
+original event sequence IDs, `time`, role, source and tool metadata. Input mutation, subsequent
+session appends and mutation of query results do not change the view. Ordinary History still
+excludes active records and rejects reads of them.
+
+The host must authorize and redact records **before** constructing the view, preserving original
+sequence numbers and successful compaction start/summary/end brackets for native window IDs.
+Filtering and redaction therefore precede counts, search and pagination. The host owns current
+authorization, session binding and cursor scope; cursors may only be reused for the same source,
+snapshot, query and direction. This API neither discovers sources nor grants access to them.
+
 The `get_context_remaining` reference page of currently active persisted messages provides at most 32 references and 4000 bytes. It is queried on demand; ordinary steps and Notes writes do not change the runtime prompt. The exhausted-window fallback also includes a reference snapshot. A full reset starts with an empty reference snapshot; archived items are addressed through History. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
 
 ## Development and packaging
@@ -75,7 +98,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack
-shasum -a 256 dsh-agent-context-0.3.0-rc.4.tgz
+shasum -a 256 dsh-agent-context-0.3.0-rc.6.tgz
 ```
 
 The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
