@@ -13,6 +13,7 @@ export interface HistoryItem {
   ordinal: number
   seq: number
   event_type: string
+  time: number
   role: 'user' | 'assistant' | 'tool' | 'system'
   source: { [key: string]: Json } | null
   tool_names: string[]
@@ -30,9 +31,12 @@ export interface HistoryQuery {
 }
 /** Successful native compaction brackets define windows, regardless of compaction provider. */
 export function windows(session: Session): WindowInfo[] {
+  return snapshotWindows(session.id, session.snapshotEvents())
+}
+function snapshotWindows(sessionId: string, events: readonly SessionEvent[]): WindowInfo[] {
   const result: WindowInfo[] = [
     {
-      window_id: `${session.id}:initial`,
+      window_id: `${sessionId}:initial`,
       ordinal: 1,
       start_seq: -1,
       end_seq: -1,
@@ -40,7 +44,7 @@ export function windows(session: Session): WindowInfo[] {
   ]
   const starts = new Map<string, number>()
   const summaries = new Set<string>()
-  for (const event of session.snapshotEvents()) {
+  for (const event of events) {
     if (event.type === 'compaction/start')
       starts.set(event.data.compactionId, event.seq)
     if (event.type === 'compaction/summary')
@@ -53,7 +57,7 @@ export function windows(session: Session): WindowInfo[] {
       const seq = starts.get(event.data.compactionId)
       if (seq !== undefined)
         result.push({
-          window_id: `${session.id}:${seq}`,
+          window_id: `${sessionId}:${seq}`,
           ordinal: result.length + 1,
           start_seq: seq,
           end_seq: event.seq,
@@ -77,10 +81,12 @@ function excluded(event: SessionEvent): boolean {
 }
 /** Normalize the persisted message payload losslessly; provenance stays in its original role. */
 export function normalizedItems(session: Session): HistoryItem[] {
-  const boundaries = windows(session)
+  return snapshotItems(session.snapshotEvents(), windows(session))
+}
+function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]): HistoryItem[] {
   const calls = new Map<string, string>()
   const items: HistoryItem[] = []
-  for (const event of session.snapshotEvents()) {
+  for (const event of events) {
     if (excluded(event)) continue
     const message =
       event.type === 'user/message'
@@ -129,6 +135,7 @@ export function normalizedItems(session: Session): HistoryItem[] {
       ordinal: window.ordinal,
       seq: event.seq,
       event_type: event.type,
+      time: event.time,
       role,
       source: JSON.parse(JSON.stringify(message.source)) as {
         [key: string]: Json
@@ -168,11 +175,14 @@ function slicePage<T extends { seq: number }>(items: T[], query: HistoryQuery) {
 }
 function metadata(item: HistoryItem) {
   const { content: _content, seq: _seq, ...result } = item
-  return result
+  return structuredClone(result)
 }
 /** List or search archived items with stable directional sequence cursors. */
 export function searchHistory(session: Session, query: HistoryQuery = {}) {
-  const filtered = collectHistory(session).filter(
+  return searchItems(collectHistory(session), query)
+}
+function searchItems(items: HistoryItem[], query: HistoryQuery) {
+  const filtered = items.filter(
     (item) =>
       (query.window_id === undefined || item.window_id === query.window_id) &&
       (query.role === undefined || item.role === query.role) &&
@@ -206,11 +216,14 @@ export function searchHistory(session: Session, query: HistoryQuery = {}) {
 }
 /** List only windows that actually contain archived messages. */
 export function listWindows(session: Session, query: HistoryQuery = {}) {
+  return listItemWindows(windows(session), collectHistory(session), query)
+}
+function listItemWindows(boundaries: WindowInfo[], items: HistoryItem[], query: HistoryQuery) {
   const counts = new Map<string, number>()
-  for (const item of collectHistory(session))
+  for (const item of items)
     counts.set(item.window_id, (counts.get(item.window_id) ?? 0) + 1)
   const page = slicePage(
-    windows(session)
+    boundaries
       .filter((w) => counts.has(w.window_id))
       .map((w) => ({ ...w, seq: w.start_seq + 1 })),
     query,
@@ -238,6 +251,9 @@ export function readHistoryItem(
   if (!item) throw new Error('not_found: no item in this session and window')
   if (session.surface.nodes.some((seq) => seq === item.seq))
     throw new Error('not_archived: item is still in the active context')
+  return readItem(item, offset, limit)
+}
+function readItem(item: HistoryItem, offset: number, limit: number) {
   const chars = Array.from(item.content)
   boundedInteger(offset, 0, chars.length, 0)
   boundedInteger(limit, 12000, 20000)
@@ -250,6 +266,34 @@ export function readHistoryItem(
     next_offset_chars: end < chars.length ? end : null,
   }
 }
+/**
+ * Create an immutable query view over caller-authorized persisted events.
+ *
+ * Args:
+ *   sessionId: Original session identity used in native window IDs.
+ *   events: Already filtered/redacted events retaining original sequence numbers.
+ *     Keep successful compaction brackets to preserve original window identity.
+ *     Both active and archived message records are included.
+ *
+ * Returns:
+ *   Queries sharing History's normalization, filtering and Unicode paging.
+ *   Changes to the input or returned objects cannot alter this snapshot.
+ *   Authorization and cursor scope binding remain the caller's responsibility.
+ */
+export function createHistoryView(sessionId: string, events: readonly SessionEvent[]) {
+  const boundaries = snapshotWindows(sessionId, events)
+  const items = snapshotItems(events, boundaries)
+  return Object.freeze({
+    listWindows: (query: HistoryQuery = {}) => listItemWindows(boundaries, items, query),
+    search: (query: HistoryQuery = {}) => searchItems(items, query),
+    read: (windowId: string, itemId: string, offset = 0, limit = 12000) => {
+      const item = items.find((i) => i.item_id === itemId && i.window_id === windowId)
+      if (!item) throw new Error('not_found: no item in this session and window')
+      return readItem(item, offset, limit)
+    },
+  })
+}
+export type HistoryView = ReturnType<typeof createHistoryView>
 /** Bounded current references, excluding this plugin's own control records. */
 export function references(session: Session, cursor?: string) {
   const active = new Set<number>(session.surface.nodes)

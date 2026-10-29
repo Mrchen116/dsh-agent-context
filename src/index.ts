@@ -66,11 +66,13 @@ function concrete(engine: CompactionEngine): CompactionEngine {
 export type { RolloverConfig, ResolvedRolloverConfig } from './config.ts'
 export { NotesStore } from './notes.ts'
 export {
+  createHistoryView,
   collectHistory,
   readHistoryItem,
   searchHistory,
   currentWindow,
 } from './history.ts'
+export type { HistoryView, HistoryQuery, HistoryItem, WindowInfo } from './history.ts'
 export {
   commitRollover,
   countRollovers,
