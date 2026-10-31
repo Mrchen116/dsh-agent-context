@@ -39,7 +39,6 @@ async function archive(session: Session) {
       owner: null,
       checkpoint: {
         reason: 'manual',
-        agentId: session.id,
         previousWindowId: currentWindow(session).window_id,
         runtimeContext: 'policy',
         notesHint: '',

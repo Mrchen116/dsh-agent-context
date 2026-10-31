@@ -30,6 +30,8 @@ it('rebuilds effective runtime state and drops the old snapshot, all tail and no
   ])
   ctx.llm.registerAdapter(['mock'], adapter)
   await followup(agent, 'OLD_USER')
+  expect(JSON.stringify(adapter.requests[0])).not.toContain('Agent name:')
+  expect(JSON.stringify(adapter.requests[0])).not.toContain('Session ID:')
   mode = 'approval-current'
   let steered = false
   ctx.on('tools/post-execute', async (exec, _result, next) => {
@@ -55,6 +57,8 @@ it('rebuilds effective runtime state and drops the old snapshot, all tail and no
   expect(request).not.toContain(
     `Current context window id: ${session.id}:initial`,
   )
+  expect(request).not.toContain('Agent name:')
+  expect(request).not.toContain('Session ID:')
   expect(request).toContain('POLICY:approval-current')
   expect(request).toContain('NEW_INPUT_MUST_SURVIVE')
   expect(request).toContain('<context_references>')

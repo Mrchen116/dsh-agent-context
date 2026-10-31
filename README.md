@@ -98,10 +98,10 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack
-shasum -a 256 dsh-agent-context-0.3.0-rc.6.tgz
+shasum -a 256 dsh-agent-context-0.3.0-rc.7.tgz
 ```
 
 The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
 
 
-Only window identity changes the ordinary runtime context contribution. Notes hints appear when a window is constructed; Skill catalogs belong to the host. Prior content is recovered through the original Notes and window/item History tools, without a separate current-turn recovery protocol.
+Only window identity changes the ordinary runtime context contribution. The window block does not label the runtime session ID as an Agent name; product identity, when needed, is supplied by the host. Notes hints appear when a window is constructed; Skill catalogs belong to the host. Prior content is recovered through the original Notes and window/item History tools, without a separate current-turn recovery protocol.

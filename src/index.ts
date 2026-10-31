@@ -108,7 +108,7 @@ export class ContextRolloverEngine extends CompactionEngine {
         order: 2350,
         text: ({ agent }) =>
           agent
-            ? windowText(agent.session, agent.id)
+            ? windowText(agent.session)
             : '',
       })
     }
@@ -323,7 +323,6 @@ export class ContextRolloverEngine extends CompactionEngine {
         ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
         checkpoint: {
           reason,
-          agentId: agent.id,
           previousWindowId: currentWindow(session).window_id,
           notesHint: await this.notes(agent).hint(),
           runtimeContext,
