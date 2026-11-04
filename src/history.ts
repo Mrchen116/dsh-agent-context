@@ -1,5 +1,5 @@
 import { SessionSeq } from '@deepseek-ai/dsh-session'
-import { itemIds, stripItemId } from './item-id.ts'
+import { itemIds, itemMessage, stripItemId } from './item-id.ts'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { boundedInteger } from './notes.ts'
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
@@ -91,7 +91,7 @@ function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]
   const calls = new Map<string, string>()
   const items: HistoryItem[] = []
   for (const event of events) {
-    if (excluded(event)) continue
+    if (excluded(event) || short && event.type === 'user/message' && !itemMessage(event)) continue
     const message =
       event.type === 'user/message'
         ? event.data

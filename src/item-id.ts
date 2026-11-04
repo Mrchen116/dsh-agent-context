@@ -4,10 +4,12 @@ import type { Message, UserMessage, ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 
+// Native assembly may commit these controls after pre-step assigns pending IDs.
+const controlSources = ['runtime-context', 'compact-checkpoint', 'agent-context', 'skill-catalog', 'agent-instructions']
 export function itemMessage(event: SessionEvent): Message | undefined {
   const message = event.type === 'user/message' ? event.data
     : event.type === 'assistant/message' || event.type === 'tool/result' ? event.data.message : undefined
-  if (!message || ['runtime-context', 'compact-checkpoint', 'agent-context'].includes(message.source.kind)) return undefined
+  if (!message || controlSources.includes(message.source.kind)) return undefined
   return message
 }
 
@@ -19,7 +21,7 @@ export function itemIds(events: readonly SessionEvent[], pending: readonly UserM
     if (message && !ids.has(message.id)) ids.set(message.id, String(ids.size + 1))
   }
   for (const message of pending) {
-    if (!['runtime-context', 'compact-checkpoint', 'agent-context'].includes(message.source.kind) && !ids.has(message.id))
+    if (!controlSources.includes(message.source.kind) && !ids.has(message.id))
       ids.set(message.id, String(ids.size + 1))
   }
   return ids
