@@ -37,6 +37,7 @@ export function stripItemId(content: readonly ContentBlock[]): ContentBlock[] {
 
 /** Annotate only admitted inputs, preserving their identity and original source. */
 export function markInputs(session: Session, pending: readonly UserMessage[]): UserMessage[] {
+  if (!pending.length) return []
   const ids = itemIds(session.snapshotEvents(), pending)
   return pending.map(message => {
     const id = ids.get(message.id)
@@ -49,15 +50,15 @@ export function markInputs(session: Session, pending: readonly UserMessage[]): U
 
 /** Final results are annotated after tools and pruning, before the next model call. */
 export function markToolResults(session: Session, meter: TokenMeter): void {
-  const ids = itemIds(session.snapshotEvents())
+  let ids: Map<string, string> | undefined
   for (const seq of [...session.surface.nodes]) {
     const event = session.eventAt(seq)
     if (event?.type !== 'tool/result') continue
     const message = session.deriveEventMessage(event)!
     if (message.role !== 'tool') continue
-    const id = ids.get(message.id)!
     const last = message.content.at(-1)
-    if (last?.type === 'text' && 'contextItemId' in last && last.contextItemId === id && last.text === marker(id)) continue
+    if (last?.type === 'text' && 'contextItemId' in last && typeof last.contextItemId === 'string' && last.text === marker(last.contextItemId)) continue
+    const id = (ids ??= itemIds(session.snapshotEvents())).get(message.id)!
     // Signed shadow pricing is required even when the replacement adds tokens.
     session.append('compaction/prune', {
       shadowedRange: { start: seq, end: seq }, shadowedSeqs: [seq],
