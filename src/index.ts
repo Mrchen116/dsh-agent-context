@@ -1,3 +1,4 @@
+import { markInputs, markToolResults } from './item-id.ts'
 import { Context, symbols } from '@deepseek-ai/cordis'
 import {
   CompactionEngine,
@@ -32,7 +33,7 @@ import {
   REMINDER_TEMPLATE,
 } from './guidance.ts'
 import { NotesStore } from './notes.ts'
-import { currentWindow, referenceText, normalizedItems } from './history.ts'
+import { currentWindow, normalizedItems } from './history.ts'
 import { windowText } from './checkpoint.ts'
 import type { RolloverReason } from './checkpoint.ts'
 import { commitRollover, selectRolloverRange } from './rollover.ts'
@@ -123,13 +124,14 @@ export class ContextRolloverEngine extends CompactionEngine {
     ctx.on(
       'agent/pre-step',
       async ({ agent, signal }, next): Promise<PreStepDecision> => {
-        const decision = await next()
+        let decision = await next()
         if (
           decision.kind === 'reject' ||
           signal.aborted ||
           this.ownedElsewhere(agent)
         )
           return decision
+        decision = { ...decision, messages: markInputs(agent.session, decision.messages) }
         const assembly =
           this.assemblies.get(agent) ??
           (await ctx.systemPrompt.assemble(assembleContextFor(agent, signal)))
@@ -146,11 +148,16 @@ export class ContextRolloverEngine extends CompactionEngine {
           this.header(agent, assembly),
           createSystemMessage(renderPrompt(assembly)),
         )
-        const reading =
+        let reading =
           agent.session.requestContext() === undefined
             ? undefined
             : reason ? measure() : this.prunePressure(agent, measure)
         if (reading && reading.T >= reading.H) reason ??= 'pressure'
+        if (!reason) {
+          markToolResults(agent.session, ctx.tokenMeter)
+          if (reading) reading = measure()
+          if (reading && reading.T >= reading.H) reason = 'pressure'
+        }
         if (reason) {
           this.pendingRollovers.delete(agent.session.id)
           await this.perform(agent, reason, signal, assembly)
@@ -172,7 +179,7 @@ export class ContextRolloverEngine extends CompactionEngine {
           if (marker && !this.delivered(agent.session, marker)) {
             const text =
               marker === 'fallback'
-                ? `${FALLBACK_PROMPT}\n${referenceText(agent.session)}`
+                ? FALLBACK_PROMPT
                 : REMINDER_TEMPLATE.replace(
                     '{n_remaining}',
                     String(reading.remaining),

@@ -28,7 +28,5 @@ it('keeps the approved Codex wording and the argument-free new_context schema', 
     prompts.HISTORY_DESCRIPTION,
   )
   expect(ctx.tools.get('notes')?.description).toBe(prompts.NOTES_DESCRIPTION)
-  expect(ctx.tools.get('get_context_remaining')?.parameters).toHaveProperty(
-    'properties.references_cursor',
-  )
+  expect(ctx.tools.get('get_context_remaining')?.parameters).toEqual({type:'object',properties:{}})
 })

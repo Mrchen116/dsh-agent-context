@@ -1,3 +1,5 @@
+import { SessionSeq } from '@deepseek-ai/dsh-session'
+import { itemIds, stripItemId } from './item-id.ts'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { boundedInteger } from './notes.ts'
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
@@ -81,9 +83,11 @@ function excluded(event: SessionEvent): boolean {
 }
 /** Normalize the persisted message payload losslessly; provenance stays in its original role. */
 export function normalizedItems(session: Session): HistoryItem[] {
-  return snapshotItems(session.snapshotEvents(), windows(session))
+  return snapshotItems(session.snapshotEvents(), windows(session), true)
 }
-function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]): HistoryItem[] {
+function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[], short = false): HistoryItem[] {
+  const ids = short ? itemIds(events) : undefined
+  const seen = new Set<string>()
   const calls = new Map<string, string>()
   const items: HistoryItem[] = []
   for (const event of events) {
@@ -95,6 +99,8 @@ function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]
           ? event.data.message
           : undefined
     if (message === undefined) continue
+    if (short && seen.has(message.id)) continue
+    seen.add(message.id)
     let role: HistoryItem['role'] =
       event.type === 'assistant/message'
         ? 'assistant'
@@ -120,7 +126,7 @@ function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]
       boundaries.findLast((w) => event.seq > w.end_seq) ?? boundaries[0]!
     // JSON preserves complete calls, arguments, result payloads and attachment metadata.
     // Text blocks additionally retain readable newlines for bounded recovery.
-    const blocks = message.content
+    const blocks = stripItemId(message.content)
       .map((block) =>
         block.type === 'text' ? block.text : JSON.stringify(block),
       )
@@ -131,7 +137,7 @@ function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]
         : blocks
     items.push({
       window_id: window.window_id,
-      item_id: String(event.seq),
+      item_id: ids?.get(message.id) ?? String(event.seq),
       ordinal: window.ordinal,
       seq: event.seq,
       event_type: event.type,
@@ -146,10 +152,19 @@ function snapshotItems(events: readonly SessionEvent[], boundaries: WindowInfo[]
   }
   return items
 }
+function activeContents(session: Session): Map<string, string> {
+  return new Map(session.deriveMessages().map(message => [message.id, JSON.stringify(stripItemId(message.content))]))
+}
+function isActive(session: Session, item: HistoryItem, active = activeContents(session)): boolean {
+  const original = session.eventAt(SessionSeq(item.seq))
+  const message = original?.type === 'user/message' ? original.data
+    : original?.type === 'assistant/message' || original?.type === 'tool/result' ? original.data.message : undefined
+  return !!message && active.get(message.id) === JSON.stringify(stripItemId(message.content))
+}
 /** Archived messages only; active message bodies never leak through History. */
 export function collectHistory(session: Session): HistoryItem[] {
-  const active = new Set<number>(session.surface.nodes)
-  return normalizedItems(session).filter((item) => !active.has(item.seq))
+  const active = activeContents(session)
+  return normalizedItems(session).filter((item) => !isActive(session, item, active))
 }
 function slicePage<T extends { seq: number }>(items: T[], query: HistoryQuery) {
   const recent = query.recent_first ?? true
@@ -249,7 +264,7 @@ export function readHistoryItem(
     (i) => i.item_id === itemId && i.window_id === windowId,
   )
   if (!item) throw new Error('not_found: no item in this session and window')
-  if (session.surface.nodes.some((seq) => seq === item.seq))
+  if (isActive(session, item))
     throw new Error('not_archived: item is still in the active context')
   return readItem(item, offset, limit)
 }
@@ -294,50 +309,3 @@ export function createHistoryView(sessionId: string, events: readonly SessionEve
   })
 }
 export type HistoryView = ReturnType<typeof createHistoryView>
-/** Bounded current references, excluding this plugin's own control records. */
-export function references(session: Session, cursor?: string) {
-  const active = new Set<number>(session.surface.nodes)
-  const page = slicePage(
-    normalizedItems(session).filter((item) => active.has(item.seq)),
-    {
-      limit: 32,
-      ...(cursor === undefined ? {} : { cursor }),
-    },
-  )
-  const items: {
-    window_id: string
-    item_id: string
-    event_type: string
-    role: HistoryItem['role']
-    source: Json
-    tool_names: string[]
-    preview: string
-  }[] = []
-  let bytes = 0
-  for (const item of page.items) {
-    const value = {
-      window_id: item.window_id,
-      item_id: item.item_id,
-      event_type: item.event_type,
-      role: item.role,
-      source: item.source?.kind ?? null,
-      tool_names: item.tool_names,
-      preview: Array.from(item.content).slice(0, 80).join(''),
-    }
-    const size = Buffer.byteLength(JSON.stringify(value)) + 1
-    if (bytes + size > 3800) break
-    items.push(value)
-    bytes += size
-  }
-  const last = items.at(-1)
-  return {
-    items,
-    next_cursor:
-      items.length < page.items.length && last
-        ? `desc:${last.item_id}`
-        : page.next_cursor,
-  }
-}
-export function referenceText(session: Session): string {
-  return `<context_references>\n${JSON.stringify(references(session))}\n</context_references>`
-}

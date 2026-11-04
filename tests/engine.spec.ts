@@ -61,7 +61,7 @@ it('rebuilds effective runtime state and drops the old snapshot, all tail and no
   expect(request).not.toContain('Session ID:')
   expect(request).toContain('POLICY:approval-current')
   expect(request).toContain('NEW_INPUT_MUST_SURVIVE')
-  expect(request).toContain('<context_references>')
+  expect(request).not.toContain('<context_references>')
   expect(request).toContain('state.md')
   expect(request).not.toContain('PRIVATE_NOTE_BODY')
   expect(request).not.toContain('OLD_ASSISTANT')

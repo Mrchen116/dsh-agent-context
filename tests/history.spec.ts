@@ -12,11 +12,11 @@ import {
 import { CompactionId } from '@deepseek-ai/dsh-compaction'
 import {
   collectHistory,
+  normalizedItems,
   currentWindow,
   searchHistory,
   readHistoryItem,
   listWindows,
-  references,
 } from '../src/history.ts'
 import { commitRollover, selectRolloverRange } from '../src/rollover.ts'
 declare module '@deepseek-ai/dsh-llm' {
@@ -114,7 +114,8 @@ it('keeps Nano provenance, complete tool arguments/results and stable IDs across
   )
   s.append('step/end', { turn: 1, step: 1 })
   s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-  const ref = references(s).items.find((i) => i.item_id === String(human.seq))!
+  const ref = normalizedItems(s).find(i => i.seq === human.seq)!
+  expect(human.seq).toBeGreaterThanOrEqual(0)
   expect(ref.window_id).toBe('history:initial')
   expect(collectHistory(s)).toHaveLength(0)
   expect(() => readHistoryItem(s, ref.window_id, ref.item_id)).toThrow(
@@ -126,7 +127,7 @@ it('keeps Nano provenance, complete tool arguments/results and stable IDs across
   expect(liveView.search({ tool_name: 'inbox', role: 'tool', query: 'TAIL_FACT' }).items[0]?.content).toContain('TAIL_FACT')
   expect(liveView.read(ref.window_id, String(result.seq), 23000).content).toContain('META_FACT')
   await archive(s)
-  expect(references(s).items).toEqual([])
+  expect(collectHistory(s)).toHaveLength(4)
   const restored = Session.create(s.id, s.snapshotEvents())
   const listed = searchHistory(restored, { limit: 1 })
   const next = searchHistory(restored, {
@@ -150,7 +151,7 @@ it('keeps Nano provenance, complete tool arguments/results and stable IDs across
     const chunk = readHistoryItem(
       restored,
       ref.window_id,
-      String(result.seq),
+      normalizedItems(restored).find(i => i.seq === result.seq)!.item_id,
       offset,
       12000,
     )
@@ -204,7 +205,7 @@ it('ignores failed brackets and assistant attempts while recognizing other succe
   expect(currentWindow(replay).window_id).toBe(currentWindow(s).window_id)
   expect(searchHistory(replay, { window_id: 'missing' }).items).toEqual([])
 })
-it('paginates a bounded reference index without exposing runtime snapshots', async () => {
+it('paginates short History references without losing entries', async () => {
   const s = Session.create(SessionId('references'))
   for (let i = 0; i < 80; i++)
     s.append(
@@ -215,11 +216,12 @@ it('paginates a bounded reference index without exposing runtime snapshots', asy
       }),
       { surfaceOp: 'append' },
     )
+  await archive(s)
   const ids: string[] = []
   let cursor: string | undefined
   do {
-    const result = references(s, cursor)
-    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4000)
+    const result = searchHistory(s, {...(cursor ? {cursor} : {}), limit: 7, max_chars_per_item: 20})
+    expect(result.items.length).toBeLessThanOrEqual(7)
     ids.push(...result.items.map((i) => i.item_id))
     cursor = result.next_cursor ?? undefined
   } while (cursor)
@@ -266,6 +268,6 @@ it('queries immutable authorized snapshots through the public export without cha
   expect(view.read(activeWindow, String(active.seq)).content).toBe('😀新😀事实')
   expect(view.read('view:initial', String(first.seq)).source).toMatchObject({ sender: 'owner' })
   expect(view.search().items).toHaveLength(2)
-  expect(searchHistory(s).items.map(i => i.item_id)).toEqual([String(first.seq)])
-  expect(() => readHistoryItem(s, activeWindow, String(active.seq))).toThrow(/not_archived/)
+  expect(searchHistory(s).items.map(i => i.item_id)).toEqual(['1'])
+  expect(() => readHistoryItem(s, activeWindow, normalizedItems(s).find(i => i.seq === active.seq)!.item_id)).toThrow(/not_archived/)
 })
