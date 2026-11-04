@@ -89,3 +89,5 @@ snapshot, query and direction. This API neither discovers sources nor grants acc
 Short IDs survive native pruning, resets and restart without a separate index file. History merges physical replacements and returns original content without the plugin's marker; annotation alone does not archive an active item. The host `createHistoryView` API deliberately retains event-sequence item IDs for existing source-evidence consumers. Old Notes using event-sequence own-History IDs are not automatically migrated; use list/search to discover the current IDs. Logs and Notes are preserved.
 
 Tool annotations use native result replacements with adjacent shadow pricing, after host pruning and finalization. No custom persistence event or per-step runtime-context reference snapshot is added. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
+
+Hosts that parse effective message content as structured JSON can use the public `stripContextItemId(content)` helper before parsing. It removes only the plugin-owned trailing marker block and preserves literal marker-looking text.

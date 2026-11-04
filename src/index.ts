@@ -1,3 +1,4 @@
+export { stripItemId as stripContextItemId } from './item-id.ts'
 import { markInputs, markToolResults } from './item-id.ts'
 import { Context, symbols } from '@deepseek-ai/cordis'
 import {
