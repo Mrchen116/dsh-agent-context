@@ -28,7 +28,8 @@ export function itemIds(events: readonly SessionEvent[], pending: readonly UserM
 const marker = (id: string) => `\n[id: ${id}]`
 export function stripItemId(content: readonly ContentBlock[]): ContentBlock[] {
   const last = content.at(-1)
-  return last?.type === 'text' && /^\n\[id: [1-9]\d*\]$/.test(last.text)
+  return last?.type === 'text' && 'contextItemId' in last &&
+    typeof last.contextItemId === 'string' && last.text === marker(last.contextItemId)
     ? content.slice(0, -1) : [...content]
 }
 
@@ -38,7 +39,9 @@ export function markInputs(session: Session, pending: readonly UserMessage[]): U
   return pending.map(message => {
     const id = ids.get(message.id)
     if (!id) return message
-    return freezeMessage({ ...message, content: [...message.content, { type: 'text', text: marker(id) }] })
+    const last = message.content.at(-1)
+    if (last?.type === 'text' && 'contextItemId' in last && last.contextItemId === id && last.text === marker(id)) return message
+    return freezeMessage({ ...message, content: [...message.content, { type: 'text', text: marker(id), contextItemId: id }] })
   })
 }
 
@@ -52,14 +55,14 @@ export function markToolResults(session: Session, meter: TokenMeter): void {
     if (message.role !== 'tool') continue
     const id = ids.get(message.id)!
     const last = message.content.at(-1)
-    if (last?.type === 'text' && last.text === marker(id)) continue
+    if (last?.type === 'text' && 'contextItemId' in last && last.contextItemId === id && last.text === marker(id)) continue
     // Signed shadow pricing is required even when the replacement adds tokens.
     session.append('compaction/prune', {
       shadowedRange: { start: seq, end: seq }, shadowedSeqs: [seq],
       shadowedTokenCount: meter.estimateMessage(message),
     })
     session.append('tool/result', { ...event.data, message: freezeMessage({
-      ...message, content: [...message.content, { type: 'text', text: marker(id) }],
+      ...message, content: [...message.content, { type: 'text', text: marker(id), contextItemId: id }],
     }) }, { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] })
   }
 }
