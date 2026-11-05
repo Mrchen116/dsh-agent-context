@@ -14,37 +14,19 @@ export function itemMessage(event: SessionEvent): Message | undefined {
   return message
 }
 
-/** Replacements retain their original window; only successful resets start a new sequence. */
+/** Replacements retain their original number; successful resets start a new sequence. */
 export function itemIds(events: readonly SessionEvent[], pending: readonly UserMessage[] = []): Map<string, string> {
   const ends = new Set(successfulCompactions(events).map(window => window.end_seq))
-  const seen = new Set<string>()
-  const published = new Map<string, number>()
-  let group: Message[] = []
-  const groups = [group]
+  const ids = new Map<string, string>()
+  let next = 1
   for (const event of events) {
-    if (ends.has(event.seq)) groups.push(group = [])
+    if (ends.has(event.seq)) next = 1
     const message = itemMessage(event)
-    if (!message) continue
-    const id = ownedItemId(message.content)
-    if (id !== undefined && !published.has(message.id)) published.set(message.id, Number(id))
-    if (!seen.has(message.id)) {
-      seen.add(message.id)
-      group.push(message)
-    }
+    if (message && !ids.has(message.id)) ids.set(message.id, String(next++))
   }
   for (const message of pending) {
-    if (!controlSources.includes(message.source.kind) && !seen.has(message.id)) {
-      seen.add(message.id)
-      group.push(message)
-    }
-  }
-  const ids = new Map<string, string>()
-  for (const messages of groups) {
-    const anchor = messages.findIndex(message => published.has(message.id))
-    // Existing rc.8 windows retain their issued base, including unprinted assistant IDs.
-    // Pending annotations are not committed facts and cannot establish this base.
-    const base = anchor < 0 ? 0 : published.get(messages[anchor]!.id)! - anchor - 1
-    messages.forEach((message, index) => ids.set(message.id, String(base + index + 1)))
+    if (!controlSources.includes(message.source.kind) && !ids.has(message.id))
+      ids.set(message.id, String(next++))
   }
   return ids
 }
