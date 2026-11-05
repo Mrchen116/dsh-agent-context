@@ -40,7 +40,8 @@ it('delivers reminder and fallback once per window, with committed references, i
   expect(JSON.stringify(notices[1])).toContain(
     'Make exactly one write or append',
   )
-  expect(JSON.stringify(notices[1])).toContain('rule two')
+  expect(JSON.stringify(notices[1])).toContain('[id:')
+  expect(JSON.stringify(notices[1])).not.toContain('<context_references>')
   expect(JSON.stringify(notices[1])).not.toContain('get_context_remaining')
   // Reconstruct a fresh Session and plugin instance. The public pre-step seam
   // must not reissue persisted reminders just because process memory is gone.

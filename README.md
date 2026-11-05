@@ -32,14 +32,14 @@ Use the host's `plugin_manager` bundle operations when available. Installing the
 | `reminderTokens` | `min(6144, floor(W * 0.1))` | Positive integer reminder distance, R. |
 | `models` | `{}` | Exact `provider:model` keys with optional `outputReserveTokens` / `bufferTokens` / `reminderTokens` overrides. |
 
-The effective model context window is C; an explicit resolved request-header `maxTokens` is the output reserve O (including adapter defaults). When the request legitimately has no cap, O uses the configured budget-only reserve or the table default. Budget reads label `output_reserve_source` as `request-maxTokens` or `policy-estimate`; the latter does not claim to know the provider output limit. H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C, invalid explicit caps/reserves and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `measurement: awaiting_first_request` and null numeric headroom; subsequent budget reads are estimates, not provider token counts.
+The effective model context window is C; an explicit resolved request-header `maxTokens` is the output reserve O (including adapter defaults). When the request legitimately has no cap, O uses the configured budget-only reserve or the table default. Internal budget diagnostics label `output_reserve_source` as `request-maxTokens` or `policy-estimate`; the latter does not claim to know the provider output limit. H = C − O; W = H − B. Configuration must satisfy `0 < R < W < H`. Missing C, invalid explicit caps/reserves and fixed input that cannot fit W are explicit errors. Before the first resolved request exists, the engine leaves ordinary first-step admission to DSH. A budget tool call before any request reports `tokens_left: null`; subsequent budget reads are estimates, not provider token counts.
 
 At W − R the engine sends one reminder per window. At W it first calls the host's public `toolResultPruner.pruneSession()` when available and remeasures the same pending request. If pressure remains, it sends one save-notes fallback with current committed references at W or resets at H. Provider overflow applies native pruning before the existing reset at a safe native boundary. Explicit `new_context` and manual resets remain explicit resets. The plugin reuses the host pruner's configuration and durable source-preserving replacements; it does not implement another truncation algorithm or change the host's per-result spill policy. Without that optional host service, the previous budget/reset behavior remains. Reminder/fallback delivery is reconstructed from the durable log after restart. Multiple windows may occur in one turn. A fixed-only context cannot keep resetting without conversational progress.
 
 ## Model tools
 
 - `new_context({})`: records a request for the next paired safe boundary. The result is `requested`, not a claim that compaction already succeeded.
-- `get_context_remaining({references_cursor?})`: returns current `window_id`, `remaining`, T/W/H/C/O/B/R, `estimated`, measurement provenance, and a reference page. A tool invocation can see just-admitted messages already persisted before that tool executes.
+- `get_context_remaining({})`: returns only `{tokens_left, estimated: true}` and renders a short estimated-budget sentence. No reference query is needed to save Notes.
 - `notes({action, ...})`: `list`, `read`, `search`, `write`, `append` within the owning Agent session.
 - `history({action, ...})`: `list_windows`, `list_items`, `search`, `read` for messages that have left the active surface.
 
@@ -57,28 +57,37 @@ Automatic hints contain at most five recent paths and 4000 UTF-8 bytes; bodies a
 
 ### History and references
 
-Native successful compaction brackets define window IDs: `<session-id>:initial`, then `<session-id>:<compaction-start-seq>`. Item IDs are persisted event sequence numbers. Display ordinals do not change the identity. Failed/unclosed brackets do not create windows; other compaction providers' successful brackets do. Session replay reproduces the same references.
+Native successful compaction brackets define window IDs: `<session-id>:initial`, then `<session-id>:<compaction-start-seq>`. Own History item IDs are short, session-local decimal integers allocated in original message order. They are reconstructed from the first occurrence of each message identity in the durable log. Assistant items consume numbers but have no inline marker, so visible IDs may have gaps. Tool replacements retain the original number. Ordinary input and final tool results carry a dedicated trailing `[id: N]` text block before their first model consumption. Failed/unclosed brackets do not create windows; other compaction providers' successful brackets do. Session replay reproduces the same references.
 
 History preserves original provenance, full tool arguments and persisted result payloads, including metadata. `nano-human` is human input; `nano-system` remains system material; Inbox results remain tool results with their nested provenance. Failed assistant attempts are excluded. Reads reject active items and cross-session references.
 
 List/search accept `window_id`, `role`, `tool_name`, `recent_first` (true), `limit` (20, maximum 100), and a directional `cursor`. Item snippets use `max_chars_per_item` (1000, maximum 4000). `read` requires `window_id` and `item_id`, with `offset_chars` (0) and `limit_chars` (12000, maximum 20000), returning `total_chars`, `next_offset_chars`, and `truncated`.
 
-The `get_context_remaining` reference page of currently active persisted messages provides at most 32 references and 4000 bytes. It is queried on demand; ordinary steps and Notes writes do not change the runtime prompt. The exhausted-window fallback also includes a reference snapshot. A full reset starts with an empty reference snapshot; archived items are addressed through History. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
+Hosts can query an authorized immutable event snapshot through the package root export:
 
-## Development and packaging
+```ts
+import { createHistoryView } from 'dsh-agent-context'
 
-Node 24 and pnpm 11.5.2 are used by CI. Build and tests resolve published DSH packages, without a sibling source checkout, generated private paths, or host-version probes.
-
-```sh
-pnpm install --frozen-lockfile
-pnpm typecheck
-pnpm test
-pnpm build
-pnpm pack
-shasum -a 256 dsh-agent-context-0.3.0-rc.4.tgz
+const view = createHistoryView(sessionId, authorizedEvents)
+view.listWindows({ limit: 20 })
+view.search({ role: 'user', query: 'literal text' }) // omit query to list items
+view.read(windowId, itemId, 0, 12000)
 ```
 
-The real public AgentLoop tests protect paired native transactions, first-request runtime reconstruction, repeated pressure resets, bounded overflow retry, restored reminder state, Notes boundaries, complete archived recovery, and scoped model-surface ownership. Host integration and an actual long model task remain separate acceptance work.
+The view includes supplied active and archived records and shares normalization, filtering,
+window identity, directional cursors and Unicode slicing with ordinary History. It retains
+original event sequence IDs, `time`, role, source and tool metadata. Input mutation, subsequent
+session appends and mutation of query results do not change the view. Ordinary History still
+excludes active records and rejects reads of them.
 
+The host must authorize and redact records **before** constructing the view, preserving original
+sequence numbers and successful compaction start/summary/end brackets for native window IDs.
+Filtering and redaction therefore precede counts, search and pagination. The host owns current
+authorization, session binding and cursor scope; cursors may only be reused for the same source,
+snapshot, query and direction. This API neither discovers sources nor grants access to them.
 
-Only window identity changes the ordinary runtime context contribution. Notes hints appear when a window is constructed; Skill catalogs belong to the host. Prior content is recovered through the original Notes and window/item History tools, without a separate current-turn recovery protocol.
+Short IDs survive native pruning, resets and restart without a separate index file. History merges physical replacements and returns original content without the plugin's marker; annotation alone does not archive an active item. The host `createHistoryView` API deliberately retains event-sequence item IDs for existing source-evidence consumers. Old Notes using event-sequence own-History IDs are not automatically migrated; use list/search to discover the current IDs. Logs and Notes are preserved.
+
+Tool annotations use native result replacements with adjacent shadow pricing, after host pruning and finalization. No custom persistence event or per-step runtime-context reference snapshot is added. Recovery records are evidence, never new authorization. Existing approvals and delivery revalidation remain the host's responsibility.
+
+Hosts that parse effective message content as structured JSON can use the public `stripContextItemId(content)` helper before parsing. It removes only the plugin-owned trailing marker block and preserves literal marker-looking text.

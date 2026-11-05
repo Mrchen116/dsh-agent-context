@@ -12,11 +12,11 @@ import {
 import { CompactionId } from '@deepseek-ai/dsh-compaction'
 import {
   collectHistory,
+  normalizedItems,
   currentWindow,
   searchHistory,
   readHistoryItem,
   listWindows,
-  references,
 } from '../src/history.ts'
 import { commitRollover, selectRolloverRange } from '../src/rollover.ts'
 declare module '@deepseek-ai/dsh-llm' {
@@ -39,7 +39,6 @@ async function archive(session: Session) {
       owner: null,
       checkpoint: {
         reason: 'manual',
-        agentId: session.id,
         previousWindowId: currentWindow(session).window_id,
         runtimeContext: 'policy',
         notesHint: '',
@@ -115,14 +114,20 @@ it('keeps Nano provenance, complete tool arguments/results and stable IDs across
   )
   s.append('step/end', { turn: 1, step: 1 })
   s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-  const ref = references(s).items.find((i) => i.item_id === String(human.seq))!
+  const ref = normalizedItems(s).find(i => i.seq === human.seq)!
+  expect(human.seq).toBeGreaterThanOrEqual(0)
   expect(ref.window_id).toBe('history:initial')
   expect(collectHistory(s)).toHaveLength(0)
   expect(() => readHistoryItem(s, ref.window_id, ref.item_id)).toThrow(
     /not_archived/,
   )
+  const { createHistoryView } = await import('../src/index.ts')
+  const liveView = createHistoryView(s.id, s.snapshotEvents())
+  expect(liveView.search({ tool_name: 'inbox', role: 'assistant' }).items[0]?.content).toContain('ORIGINAL_ARGUMENT')
+  expect(liveView.search({ tool_name: 'inbox', role: 'tool', query: 'TAIL_FACT' }).items[0]?.content).toContain('TAIL_FACT')
+  expect(liveView.read(ref.window_id, String(result.seq), 23000).content).toContain('META_FACT')
   await archive(s)
-  expect(references(s).items).toEqual([])
+  expect(collectHistory(s)).toHaveLength(4)
   const restored = Session.create(s.id, s.snapshotEvents())
   const listed = searchHistory(restored, { limit: 1 })
   const next = searchHistory(restored, {
@@ -146,7 +151,7 @@ it('keeps Nano provenance, complete tool arguments/results and stable IDs across
     const chunk = readHistoryItem(
       restored,
       ref.window_id,
-      String(result.seq),
+      normalizedItems(restored).find(i => i.seq === result.seq)!.item_id,
       offset,
       12000,
     )
@@ -200,7 +205,7 @@ it('ignores failed brackets and assistant attempts while recognizing other succe
   expect(currentWindow(replay).window_id).toBe(currentWindow(s).window_id)
   expect(searchHistory(replay, { window_id: 'missing' }).items).toEqual([])
 })
-it('paginates a bounded reference index without exposing runtime snapshots', async () => {
+it('paginates short History references without losing entries', async () => {
   const s = Session.create(SessionId('references'))
   for (let i = 0; i < 80; i++)
     s.append(
@@ -211,13 +216,58 @@ it('paginates a bounded reference index without exposing runtime snapshots', asy
       }),
       { surfaceOp: 'append' },
     )
+  await archive(s)
   const ids: string[] = []
   let cursor: string | undefined
   do {
-    const result = references(s, cursor)
-    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4000)
+    const result = searchHistory(s, {...(cursor ? {cursor} : {}), limit: 7, max_chars_per_item: 20})
+    expect(result.items.length).toBeLessThanOrEqual(7)
     ids.push(...result.items.map((i) => i.item_id))
     cursor = result.next_cursor ?? undefined
   } while (cursor)
   expect(new Set(ids).size).toBe(80)
+})
+
+it('queries immutable authorized snapshots through the public export without changing ordinary history', async () => {
+  const { createHistoryView } = await import('../src/index.ts')
+  const s = Session.create(SessionId('view'))
+  const first = s.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'old authorized 😀 evidence'.repeat(300) }],
+    source: { kind: 'nano-human', sender: 'owner' },
+  }), { surfaceOp: 'append' })
+  await archive(s)
+  const activeWindow = currentWindow(s).window_id
+  const hidden = s.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'SECRET unauthorized' }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  const active = s.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: '😀新😀事实' }],
+    source: { kind: 'nano-human', sender: 'owner' },
+  }), { surfaceOp: 'append' })
+  const events = structuredClone(s.snapshotEvents().filter(e => e.seq !== hidden.seq))
+  const view = createHistoryView(s.id, events)
+  expect(view.listWindows({ recent_first: false }).items).toEqual([
+    { window_id: 'view:initial', ordinal: 1, item_count: 1 },
+    { window_id: activeWindow, ordinal: 2, item_count: 1 },
+  ])
+  const page = view.search({ recent_first: false, limit: 1 })
+  expect(page.items[0]).toMatchObject({ item_id: String(first.seq), time: first.time, source: { sender: 'owner' } })
+  expect(view.search({ recent_first: false, cursor: page.next_cursor! }).items[0]?.item_id).toBe(String(active.seq))
+  expect(view.search({ query: 'SECRET' }).items).toEqual([])
+  expect(() => view.read(activeWindow, String(hidden.seq))).toThrow(/not_found/)
+  expect(() => view.read('other:initial', String(first.seq))).toThrow(/not_found/)
+  expect(view.read(activeWindow, String(active.seq), 1, 2)).toMatchObject({ content: '新😀', truncated: true, next_offset_chars: 3, total_chars: 5 })
+  expect(view.search({ query: '😀', role: 'user', window_id: activeWindow }).items).toHaveLength(1)
+  expect(() => view.search({ recent_first: true, cursor: page.next_cursor! })).toThrow(/cursor/)
+  // Neither input mutation, later appends nor returned provenance can change the view.
+  const input = events.find(e => e.seq === active.seq)!
+  if (input.type === 'user/message') Reflect.set(input.data.content, 'length', 0)
+  page.items[0]!.source!.sender = 'mutated'
+  s.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'later' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+  expect(view.read(activeWindow, String(active.seq)).content).toBe('😀新😀事实')
+  expect(view.read('view:initial', String(first.seq)).source).toMatchObject({ sender: 'owner' })
+  expect(view.search().items).toHaveLength(2)
+  expect(searchHistory(s).items.map(i => i.item_id)).toEqual(['1'])
+  expect(() => readHistoryItem(s, activeWindow, normalizedItems(s).find(i => i.seq === active.seq)!.item_id)).toThrow(/not_archived/)
 })

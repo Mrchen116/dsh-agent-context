@@ -5,8 +5,6 @@ import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { ResolvedRolloverConfig } from './config.ts'
 import { NotesStore } from './notes.ts'
 import {
-  currentWindow,
-  references,
   listWindows,
   searchHistory,
   readHistoryItem,
@@ -51,32 +49,23 @@ export function createRolloverTools(
     }),
     defineTool({
       name: 'get_context_remaining',
-      description:
-        'Get the remaining tokens in the current context window. Returns an estimated persisted-surface budget and paginated current window/item references; pass references_cursor to continue.',
-      parameters: {
-        references_cursor: {
-          type: 'string',
-          description:
-            'Continuation cursor returned by the preceding reference page.',
+      description: 'Get the estimated remaining working tokens in the current context window; null means unavailable.',
+      parameters: {},
+      output: {
+        schema: { type: 'json' },
+        render: (_args, raw) => {
+          const value = raw as { tokens_left: number | null }
+          return [{ type: 'text', text: value.tokens_left === null
+            ? 'Remaining context budget is unavailable.'
+            : `Approximately ${value.tokens_left} tokens left in this context window.` }]
         },
       },
-      output,
       isConcurrencySafe: () => true,
-      async execute(args, exec) {
+      async execute(_args, exec) {
         const agent = agentFor(exec)
         return {
-          window_id: currentWindow(agent.session).window_id,
-          ...(agent.session.requestHeader() === undefined
-            ? {
-                remaining: null,
-                T: null,
-                W: null,
-                H: null,
-                estimated: true,
-                measurement: 'awaiting_first_request',
-              }
-            : budget(agent, deps.meter, deps.config)),
-          references: references(agent.session, args.references_cursor),
+          tokens_left: agent.session.requestHeader() === undefined ? null : budget(agent, deps.meter, deps.config).remaining,
+          estimated: true,
         }
       },
     }),

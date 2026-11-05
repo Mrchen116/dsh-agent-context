@@ -180,7 +180,11 @@ it.each([
   ctx.llm.registerAdapter(['mock'], adapter)
   await followup(agent, 'CURRENT_INBOX_TASK: inspect every volume before reporting todos')
   const events = session.snapshotEvents()
-  expect(events.filter(e => e.type === 'compaction/prune')).toHaveLength(explicit ? 0 : 25)
+  expect(events.filter(e => {
+    if (e.type !== 'compaction/prune') return false
+    const next = events[e.seq + 1]
+    return next?.type === 'tool/result' && e.data.shadowedTokenCount > ctx.tokenMeter.estimateMessage(next.data.message)
+  })).toHaveLength(explicit ? 0 : 25)
   expect(countRollovers(session)).toBe(resets)
   expect(adapter.requests).toHaveLength(2)
   const requestText = adapter.requests[1]!.flatMap(m => m.content.filter(b => b.type === 'text').map(b => b.text)).join('\n')

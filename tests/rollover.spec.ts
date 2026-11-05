@@ -31,7 +31,6 @@ async function fixture(text = 'long evidence '.repeat(400)) {
 }
 const checkpoint = {
   reason: 'manual' as const,
-  agentId: 'range-test',
   previousWindowId: 'range-test:initial',
   notesHint: '',
   runtimeContext: 'CURRENT_POLICY',
