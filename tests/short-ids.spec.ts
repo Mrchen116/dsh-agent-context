@@ -98,3 +98,63 @@ it('keeps a first admitted input ID stable when native controls are committed be
  expect(itemIds(replay.snapshotEvents()).get(input.id)).toBe('1')
  expect(normalizedItems(replay)).toMatchObject([{item_id:'1',content:'ORIGINAL_REQUIREMENT'}])
 })
+
+it('restarts IDs in each successful window and resolves identical short IDs by their original windows after replay', async () => {
+  const {ctx,agent,session,engine}=await engineHarness('window-local-ids')
+  const {currentWindow,normalizedItems}=await import('../src/history.ts')
+  const adapter=new ScriptedAdapter([textResponse('completed work '+'detail '.repeat(2000))])
+  ctx.llm.registerAdapter(['mock'],adapter)
+  const references: Array<{window:string;body:string}> = []
+  for (const body of ['FIRST_WINDOW_REQUEST','SECOND_WINDOW_REQUEST','THIRD_WINDOW_REQUEST']) {
+    const window=currentWindow(session).window_id
+    await followup(agent,body)
+    const input=adapter.requests.at(-1)!.find(m=>m.content.some(b=>b.type==='text'&&b.text===body))!
+    expect(id(text(input))).toBe('1')
+    references.push({window,body})
+    await engine.compactNow(agent,new AbortController().signal)
+  }
+  const replay=Session.create(session.id,JSON.parse(JSON.stringify(session.snapshotEvents())),session.header)
+  for (const {window,body} of references) expect(readHistoryItem(replay,window,'1').content).toBe(body)
+  expect(normalizedItems(replay).filter(i=>i.role==='user').map(i=>i.item_id)).toEqual(['1','1','1'])
+})
+
+it('preserves already published legacy-window IDs including unmarked assistant items, while the next window starts at one', async () => {
+  const {ctx,agent,session,engine}=await engineHarness('legacy-window-base')
+  const {currentWindow,normalizedItems}=await import('../src/history.ts')
+  const {createUserMessage,freezeMessage}=await import('@deepseek-ai/dsh-llm')
+  const adapter=new ScriptedAdapter([textResponse('completed work '+'detail '.repeat(2000))])
+  ctx.llm.registerAdapter(['mock'],adapter)
+  await followup(agent,'first request')
+  await engine.compactNow(agent,new AbortController().signal)
+  const legacyWindow=currentWindow(session).window_id
+  const legacy=createUserMessage({source:{kind:'user'},content:[{type:'text',text:'PUBLISHED_LEGACY_REQUEST'}]})
+  session.append('user/message',freezeMessage({...legacy,content:[...legacy.content,{type:'text',text:'\n[id: 41]',contextItemId:'41'}]}),{surfaceOp:'append'})
+  await followup(agent,'CONTINUE_LEGACY_WINDOW')
+  const input=adapter.requests.at(-1)!.find(m=>m.content.some(b=>b.type==='text'&&b.text==='CONTINUE_LEGACY_WINDOW'))!
+  expect(id(text(input))).toBe('42')
+  expect(normalizedItems(session).find(i=>i.window_id===legacyWindow&&i.role==='assistant')?.item_id).toBe('43')
+  await engine.compactNow(agent,new AbortController().signal)
+  const replay=Session.create(session.id,JSON.parse(JSON.stringify(session.snapshotEvents())),session.header)
+  expect(readHistoryItem(replay,legacyWindow,'41').content).toBe('PUBLISHED_LEGACY_REQUEST')
+  expect(readHistoryItem(replay,legacyWindow,'42').content).toBe('CONTINUE_LEGACY_WINDOW')
+  expect(readHistoryItem(replay,legacyWindow,'43').role).toBe('assistant')
+  await followup(agent,'NEW_WINDOW_REQUEST')
+  expect(id(text(adapter.requests.at(-1)!.find(m=>m.content.some(b=>b.type==='text'&&b.text==='NEW_WINDOW_REQUEST'))!))).toBe('1')
+})
+
+it('does not restart numbering for an incomplete or failed native compaction', async () => {
+  const {ctx,agent,session,engine}=await engineHarness('failed-window-ids')
+  const {createUserMessage}=await import('@deepseek-ai/dsh-llm')
+  const {itemIds}=await import('../src/item-id.ts')
+  const adapter=new ScriptedAdapter([textResponse('completed work '+'detail '.repeat(2000))])
+  ctx.llm.registerAdapter(['mock'],adapter)
+  await followup(agent,'ORIGINAL')
+  await engine.compactNow(agent,new AbortController().signal)
+  const events=session.snapshotEvents()
+  const pending=createUserMessage({source:{kind:'user'},content:[{type:'text',text:'PENDING'}]})
+  const incomplete=events.filter(e=>e.type!=='compaction/end')
+  const failed=events.map(e=>e.type==='compaction/end'?{...e,data:{...e.data,error:'failed'}}:e)
+  expect(itemIds(incomplete,[pending]).get(pending.id)).toBe('3')
+  expect(itemIds(failed,[pending]).get(pending.id)).toBe('3')
+  expect(itemIds(events,[pending]).get(pending.id)).toBe('1')
+})

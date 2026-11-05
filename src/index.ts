@@ -164,9 +164,9 @@ export class ContextRolloverEngine extends CompactionEngine {
           await this.perform(agent, reason, signal, assembly)
           return {
             ...decision,
-            messages: decision.messages.filter(
+            messages: markInputs(agent.session, decision.messages.filter(
               (m) => (m.source.kind as string) !== 'runtime-context',
-            ),
+            )),
             startsRequestSeries: true,
           }
         }
