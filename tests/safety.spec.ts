@@ -60,6 +60,8 @@ it('hard-cap pressure crosses multiple windows in the same turn, preserving only
       .map((e) => e.data.turn),
   ).toEqual([2, 2, 2])
   expect(JSON.stringify(adapter.requests[1])).toContain('NEW_TASK_INPUT')
+  const input=adapter.requests[1]!.find(m=>m.content.some(b=>b.type==='text'&&b.text==='NEW_TASK_INPUT'))!
+  expect(input.content.filter(b=>b.type==='text'&&'contextItemId' in b)).toEqual([{type:'text',text:'\n[id: 1]',contextItemId:'1'}])
   expect(JSON.stringify(adapter.requests[1])).not.toContain('old response')
   expect(JSON.stringify(adapter.requests.at(-1))).toContain(
     'CURRENT_AUTHORIZATION_POLICY',

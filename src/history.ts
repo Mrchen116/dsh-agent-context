@@ -3,12 +3,10 @@ import { itemIds, itemMessage, stripItemId } from './item-id.ts'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { boundedInteger } from './notes.ts'
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
-export interface WindowInfo {
-  window_id: string
-  ordinal: number
-  start_seq: number
-  end_seq: number
-}
+import { windows, snapshotWindows } from './windows.ts'
+import type { WindowInfo } from './windows.ts'
+export { windows, currentWindow } from './windows.ts'
+export type { WindowInfo } from './windows.ts'
 export interface HistoryItem {
   window_id: string
   item_id: string
@@ -30,47 +28,6 @@ export interface HistoryQuery {
   cursor?: string
   recent_first?: boolean
   max_chars_per_item?: number
-}
-/** Successful native compaction brackets define windows, regardless of compaction provider. */
-export function windows(session: Session): WindowInfo[] {
-  return snapshotWindows(session.id, session.snapshotEvents())
-}
-function snapshotWindows(sessionId: string, events: readonly SessionEvent[]): WindowInfo[] {
-  const result: WindowInfo[] = [
-    {
-      window_id: `${sessionId}:initial`,
-      ordinal: 1,
-      start_seq: -1,
-      end_seq: -1,
-    },
-  ]
-  const starts = new Map<string, number>()
-  const summaries = new Set<string>()
-  for (const event of events) {
-    if (event.type === 'compaction/start')
-      starts.set(event.data.compactionId, event.seq)
-    if (event.type === 'compaction/summary')
-      summaries.add(event.data.compactionId)
-    if (
-      event.type === 'compaction/end' &&
-      event.data.error === undefined &&
-      summaries.has(event.data.compactionId)
-    ) {
-      const seq = starts.get(event.data.compactionId)
-      if (seq !== undefined)
-        result.push({
-          window_id: `${sessionId}:${seq}`,
-          ordinal: result.length + 1,
-          start_seq: seq,
-          end_seq: event.seq,
-        })
-    }
-  }
-  return result
-}
-/** Current persisted window identity, also valid after session restoration. */
-export function currentWindow(session: Session): WindowInfo {
-  return windows(session).at(-1)!
 }
 function excluded(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
