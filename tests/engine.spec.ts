@@ -65,6 +65,7 @@ it('rebuilds effective runtime state and drops the old snapshot, all tail and no
     .map(block => block.text)
     .join('\n')
   expect(body.split('POLICY:approval-current')).toHaveLength(2)
+  expect(body.split('<context_window>\n')).toHaveLength(2)
   expect(request).toContain('NEW_INPUT_MUST_SURVIVE')
   expect(request).not.toContain('<context_references>')
   expect(request).toContain('state.md')
