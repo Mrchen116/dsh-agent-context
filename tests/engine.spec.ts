@@ -59,7 +59,13 @@ it('rebuilds effective runtime state and drops the old snapshot, all tail and no
   )
   expect(request).not.toContain('Agent name:')
   expect(request).not.toContain('Session ID:')
-  expect(request).toContain('POLICY:approval-current')
+  const body = adapter.requests.at(-1)!
+    .flatMap(message => message.content)
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+  expect(body.split('POLICY:approval-current')).toHaveLength(2)
+  expect(body.split('<context_window>\n')).toHaveLength(2)
   expect(request).toContain('NEW_INPUT_MUST_SURVIVE')
   expect(request).not.toContain('<context_references>')
   expect(request).toContain('state.md')
@@ -131,6 +137,6 @@ it('does not copy unchanged runtime instructions for ordinary progress or Notes 
     message.content.filter(block => block.type === 'text').map(block => block.text),
   ).join('\n').split('STABLE_SKILL_BODY').length - 1)
   expect(copies).toHaveLength(6)
-  expect(copies[0]).toBeGreaterThan(0)
+  expect(copies[0]).toBe(1)
   expect(copies).toEqual(Array(6).fill(copies[0]))
 })

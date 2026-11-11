@@ -261,10 +261,7 @@ export async function commitRollover(
       0,
     )
 
-    const checkpointText = buildCheckpointText(
-      options.checkpoint,
-      `${session.id}:${startEvent.seq}`,
-    )
+    const checkpointText = buildCheckpointText(options.checkpoint)
     const checkpointMessage = createUserMessage({
       content: [{ type: 'text', text: checkpointText }],
       source: compactCheckpointSource(compactionId, options.sourceCommandId),

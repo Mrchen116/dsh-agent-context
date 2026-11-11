@@ -18,12 +18,14 @@ import {
   boundContextSummary,
   createUserMessage,
   createSystemMessage,
+  type ContextFormed,
 } from '@deepseek-ai/dsh-llm'
 import type { EpochHeader } from '@deepseek-ai/dsh-session'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import {
-  renderContextSnapshot,
   renderPrompt,
+  renderContextSections,
+  joinContextSections,
 } from '@deepseek-ai/dsh-system-prompt'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { Config, resolveConfig } from './config.ts'
@@ -42,6 +44,7 @@ import { createRolloverTools } from './tools.ts'
 import { budget } from './budget.ts'
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
+    'runtime-context': { kind: 'runtime-context' } & ContextFormed
     'agent-context': { kind: 'agent-context'; form: 'notice'; summary: string }
   }
 }
@@ -162,10 +165,11 @@ export class ContextRolloverEngine extends CompactionEngine {
         if (reason) {
           this.pendingRollovers.delete(agent.session.id)
           await this.perform(agent, reason, signal, assembly)
+          await this.appendRuntimeSnapshot(agent, signal)
           return {
             ...decision,
             messages: markInputs(agent.session, decision.messages.filter(
-              (m) => (m.source.kind as string) !== 'runtime-context',
+              (m) => m.source.kind !== 'runtime-context',
             )),
             startsRequestSeries: true,
           }
@@ -223,6 +227,7 @@ export class ContextRolloverEngine extends CompactionEngine {
       const generation = agent.session.surface.replaceGeneration
       try {
         await this.perform(agent, 'overflow', signal)
+        await this.appendRuntimeSnapshot(agent, signal)
       } catch (error) {
         ctx.logger.warn(`context overflow recovery failed: ${String(error)}`)
         return next()
@@ -232,6 +237,20 @@ export class ContextRolloverEngine extends CompactionEngine {
         : next()
     })
   }
+  /** Rebuild current context after the checkpoint has replaced the old window. */
+  private async appendRuntimeSnapshot(agent: Agent, signal: AbortSignal) {
+    const assembly = await this.ctx.systemPrompt.assemble(
+      assembleContextFor(agent, signal),
+    )
+    const sections = renderContextSections(assembly)
+    const snapshot = createUserMessage({
+      source: { kind: 'runtime-context', form: 'snapshot', sections },
+      content: [{ type: 'text', text: joinContextSections(sections) }],
+    })
+    agent.session.append('user/message', snapshot, { surfaceOp: 'append' })
+    await this.ctx.sessions.flush(agent.session)
+  }
+
   /** Reuse the host's native pruning transaction before spending the fallback reserve. */
   private prunePressure(agent: Agent, measure: () => ReturnType<typeof budget>) {
     const reading = measure()
@@ -307,10 +326,6 @@ export class ContextRolloverEngine extends CompactionEngine {
       throw new Error(
         'agent-context: no conversational progress since the previous window; cannot shrink fixed context',
       )
-    const runtimeContext = renderContextSnapshot({
-      ...assembly,
-      contexts: assembly.contexts.filter((c) => c.name !== CONTEXT_NAME),
-    })
     if (session.requestContext())
       budget(
         agent,
@@ -333,7 +348,8 @@ export class ContextRolloverEngine extends CompactionEngine {
           reason,
           previousWindowId: currentWindow(session).window_id,
           notesHint: await this.notes(agent).hint(),
-          runtimeContext,
+          // The next request receives its own current runtime-context snapshot.
+          runtimeContext: '',
         },
         flush: async () => {
           await this.ctx.sessions.flush(session)
