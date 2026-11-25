@@ -14,13 +14,20 @@ async function run(
   name: string,
   args: Record<string, unknown>,
 ) {
-  const result = await ctx.tools.execute({
+  const batch = await ctx.tools.execute({
+    calls: [
+      {
+        type: 'tool-call',
+        id: ToolCallId('test'),
+        name,
+        arguments: JSON.stringify(args),
+      },
+    ],
     signal: new AbortController().signal,
-    callId: ToolCallId('test'),
-    name,
-    arguments: args,
     agent,
   })
+  const result = batch.results[0]?.result
+  if (!result) throw new Error(`missing tool result for ${name}`)
   if (result.isError) throw new Error(JSON.stringify(result.content))
   if (name === 'get_context_remaining') return result.value as {tokens_left:number|null;estimated:boolean}
   return JSON.parse(

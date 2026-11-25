@@ -244,3 +244,94 @@ it('prunes native tool results before the existing provider-overflow reset', asy
   expect(countRollovers(session)).toBe(1)
   expect(adapter.requests).toHaveLength(3)
 })
+
+it('counts resolved tool schema tokens during pre-step admission and filters false conditional tools', async () => {
+  const { ctx, engine, agent } = await engineHarness('tool-schema-budget')
+  const { estimateToolsTokens } = await import('@deepseek-ai/dsh-token-meter/estimate')
+  ctx.tools.register(
+    defineTool({
+      name: 'active_heavy_tool',
+      description: 'Active schema '.repeat(200),
+      parameters: {
+        payload: { type: 'string', description: 'Payload '.repeat(100) },
+      },
+      output: { schema: { type: 'json' }, render: () => [] },
+      execute: async () => ({}),
+    }),
+    { when: () => true },
+  )
+  ctx.tools.register(
+    defineTool({
+      name: 'inactive_heavy_tool',
+      description: 'Inactive schema '.repeat(800),
+      parameters: {},
+      output: { schema: { type: 'json' }, render: () => [] },
+      execute: async () => ({}),
+    }),
+    { when: () => false },
+  )
+  const adapter = new ScriptedAdapter([
+    textResponse('first'),
+    textResponse('second'),
+  ])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'hello')
+  const headerTools = agent.session.requestHeader()?.tools ?? []
+  expect(headerTools.some(t => t.name === 'active_heavy_tool')).toBe(true)
+  expect(headerTools.some(t => t.name === 'inactive_heavy_tool')).toBe(false)
+  const toolTokens = estimateToolsTokens(agent.session.requestHeader())
+  expect(toolTokens).toBeGreaterThan(200)
+  const reading = budget(agent, ctx.tokenMeter, engine.config)
+  expect(reading.fixed_tokens).toBeGreaterThan(toolTokens)
+})
+
+it('rolls over before the first small-model request when switching from a large context window', async () => {
+  const { ctx, agent, session } = await engineHarness('model-switch-shrink', {}, { maxTokens: 4000 })
+  class DualWindowAdapter extends ScriptedAdapter {
+    readonly models: string[] = []
+    override async resolveModel(provider: string, model: string) {
+      return {
+        provider,
+        id: model,
+        name: model,
+        context: { contextWindow: model === 'small' ? 24000 : 200000 },
+        systemPromptUpdate: 'in-history' as const,
+      }
+    }
+    override async *stream(options: Parameters<ScriptedAdapter['stream']>[0]) {
+      this.models.push(options.model)
+      yield* super.stream(options)
+    }
+  }
+  let phase = 'one'
+  ctx.systemPrompt.section({
+    name: 'dynamic-mode',
+    order: 2400,
+    text: () => `DYNAMIC_PHASE:${phase}`,
+  })
+  const adapter = new DualWindowAdapter([
+    usageResponse('first large answer '.repeat(2500), 30000),
+    usageResponse('second large answer '.repeat(2500), 35000),
+    textResponse('small model succeeded cleanly'),
+  ])
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await followup(agent, 'turn one on large model')
+  phase = 'two'
+  await followup(agent, 'turn two appends in-history system message')
+  expect(
+    session.deriveMessages().filter(m => m.role === 'system'),
+  ).toHaveLength(2)
+  expect(countRollovers(session)).toBe(0)
+
+  agent.model.select({ provider: 'mock', model: 'small' })
+  await followup(agent, 'continue on smaller model')
+  expect(countRollovers(session)).toBe(1)
+  expect(adapter.models).toEqual(['mock', 'mock', 'small'])
+  const smallRequest = adapter.requests[2]!
+  expect(JSON.stringify(smallRequest)).not.toContain('first large answer')
+  expect(JSON.stringify(smallRequest)).toContain('continue on smaller model')
+  const reminderBlocks = smallRequest
+    .flatMap(m => m.content)
+    .filter(b => b.type === 'text' && b.text.includes('<system-reminder>'))
+  expect(reminderBlocks).toHaveLength(1)
+})

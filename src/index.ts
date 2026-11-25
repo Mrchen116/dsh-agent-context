@@ -11,7 +11,7 @@ import type {
   CompactionTrigger,
 } from '@deepseek-ai/dsh-compaction'
 import { assembleContextFor } from '@deepseek-ai/dsh-agent'
-import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
+import type { Agent, ModelSelection, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
@@ -22,11 +22,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { EpochHeader } from '@deepseek-ai/dsh-session'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
-import {
-  renderPrompt,
-  renderContextSections,
-  joinContextSections,
-} from '@deepseek-ai/dsh-system-prompt'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import { Config, resolveConfig } from './config.ts'
 import type { RolloverConfig, ResolvedRolloverConfig } from './config.ts'
@@ -42,6 +38,7 @@ import type { RolloverReason } from './checkpoint.ts'
 import { commitRollover, selectRolloverRange } from './rollover.ts'
 import { createRolloverTools } from './tools.ts'
 import { budget } from './budget.ts'
+import type { BudgetModelContext } from './budget.ts'
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'runtime-context': { kind: 'runtime-context' } & ContextFormed
@@ -91,7 +88,6 @@ export class ContextRolloverEngine extends CompactionEngine {
   static Config = Config
   readonly config: ResolvedRolloverConfig
   private readonly pendingRollovers = new Set<string>()
-  private readonly assemblies = new WeakMap<Agent, PromptAssembly>()
   constructor(ctx: Context, config: RolloverConfig = {}) {
     super(ctx)
     this.config = resolveConfig(config)
@@ -117,17 +113,9 @@ export class ContextRolloverEngine extends CompactionEngine {
             : '',
       })
     }
-    ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
-      const assembly = await next()
-      const agent = context.agent
-      if (agent && !this.ownedElsewhere(agent)) {
-        this.assemblies.set(agent, assembly)
-      }
-      return assembly
-    })
     ctx.on(
       'agent/pre-step',
-      async ({ agent, signal }, next): Promise<PreStepDecision> => {
+      async ({ agent, signal, modelSelection }, next): Promise<PreStepDecision> => {
         let decision = await next()
         if (
           decision.kind === 'reject' ||
@@ -136,26 +124,35 @@ export class ContextRolloverEngine extends CompactionEngine {
         )
           return decision
         decision = { ...decision, messages: markInputs(agent.session, decision.messages) }
-        const assembly =
-          this.assemblies.get(agent) ??
-          (await ctx.systemPrompt.assemble(assembleContextFor(agent, signal)))
+        const assembly = await this.assembleFor(agent, signal, modelSelection)
+        const modelContext = await this.resolveBudgetContext(
+          agent,
+          signal,
+          modelSelection,
+        )
         let reason: RolloverReason | undefined = this.pendingRollovers.has(
           agent.session.id,
         )
           ? 'model-requested'
           : undefined
-        const measure = () => budget(
-          agent,
-          ctx.tokenMeter,
-          this.config,
-          decision.messages,
-          this.header(agent, assembly),
-          createSystemMessage(renderPrompt(assembly)),
-        )
+        const header = this.header(agent, assembly, modelSelection)
+        const systemMessage = createSystemMessage(renderPrompt(assembly))
+        const measure = () =>
+          budget(
+            agent,
+            ctx.tokenMeter,
+            this.config,
+            decision.messages,
+            header,
+            systemMessage,
+            modelContext,
+          )
         let reading =
-          agent.session.requestContext() === undefined
+          modelContext === undefined
             ? undefined
-            : reason ? measure() : this.prunePressure(agent, measure)
+            : reason
+              ? measure()
+              : this.prunePressure(agent, measure)
         if (reading && reading.T >= reading.H) reason ??= 'pressure'
         if (!reason) {
           markToolResults(agent.session, ctx.tokenMeter)
@@ -164,8 +161,16 @@ export class ContextRolloverEngine extends CompactionEngine {
         }
         if (reason) {
           this.pendingRollovers.delete(agent.session.id)
-          await this.perform(agent, reason, signal, assembly)
-          await this.appendRuntimeSnapshot(agent, signal)
+          await this.perform(
+            agent,
+            reason,
+            signal,
+            assembly,
+            'current-turn',
+            undefined,
+            modelSelection,
+            modelContext,
+          )
           return {
             ...decision,
             messages: markInputs(agent.session, decision.messages.filter(
@@ -227,7 +232,6 @@ export class ContextRolloverEngine extends CompactionEngine {
       const generation = agent.session.surface.replaceGeneration
       try {
         await this.perform(agent, 'overflow', signal)
-        await this.appendRuntimeSnapshot(agent, signal)
       } catch (error) {
         ctx.logger.warn(`context overflow recovery failed: ${String(error)}`)
         return next()
@@ -237,18 +241,92 @@ export class ContextRolloverEngine extends CompactionEngine {
         : next()
     })
   }
-  /** Rebuild current context after the checkpoint has replaced the old window. */
-  private async appendRuntimeSnapshot(agent: Agent, signal: AbortSignal) {
-    const assembly = await this.ctx.systemPrompt.assemble(
-      assembleContextFor(agent, signal),
-    )
-    const sections = renderContextSections(assembly)
-    const snapshot = createUserMessage({
-      source: { kind: 'runtime-context', form: 'snapshot', sections },
-      content: [{ type: 'text', text: joinContextSections(sections) }],
+
+  /** Resolve the step's active model selection across live AgentModel and synthetic carriers. */
+  private selectionOf(
+    agent: Agent,
+    explicit?: Readonly<ModelSelection>,
+  ): Readonly<ModelSelection> | undefined {
+    if (explicit !== undefined) return explicit
+    const current = (agent as Partial<Agent>).model?.current()
+    if (current !== undefined) return current
+    const header = agent.session.requestHeader()?.config
+    const provider = header?.provider ?? agent.options.provider
+    const model = header?.model ?? agent.options.model
+    if (!provider || !model) return undefined
+    const reasoningEffort =
+      header?.reasoningEffort ?? agent.options.reasoningEffort
+    return {
+      provider,
+      model,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    }
+  }
+
+  /** Assemble prompt and admitted tool schemas using the same step admission contract as AgentLoop. */
+  private async assembleFor(
+    agent: Agent,
+    signal: AbortSignal,
+    explicitSelection?: Readonly<ModelSelection>,
+  ): Promise<PromptAssembly> {
+    const modelSelection = this.selectionOf(agent, explicitSelection)
+    if (modelSelection === undefined) {
+      return this.ctx.systemPrompt.assemble(assembleContextFor(agent, signal))
+    }
+    const toolSet = await this.ctx.tools.resolve({
+      agent,
+      modelSelection,
+      signal,
     })
-    agent.session.append('user/message', snapshot, { surfaceOp: 'append' })
-    await this.ctx.sessions.flush(agent.session)
+    try {
+      return await this.ctx.systemPrompt.assemble({
+        ...assembleContextFor(agent, signal),
+        modelSelection,
+        toolSet,
+      })
+    } finally {
+      toolSet.dispose()
+    }
+  }
+
+  /** Resolve context window metadata for the step's target model when switching routes before a request. */
+  private async resolveBudgetContext(
+    agent: Agent,
+    signal: AbortSignal,
+    explicitSelection?: Readonly<ModelSelection>,
+  ): Promise<BudgetModelContext | undefined> {
+    const persisted = agent.session.requestContext()
+    const selection = this.selectionOf(agent, explicitSelection)
+    if (
+      selection === undefined ||
+      (persisted !== undefined &&
+        persisted.provider === selection.provider &&
+        persisted.model === selection.model)
+    ) {
+      return persisted
+    }
+    if (persisted === undefined && agent.session.surface.nodes.length === 0) {
+      return undefined
+    }
+    try {
+      const info = await this.ctx.llm.resolveModelInfo(
+        selection.provider,
+        selection.model,
+        signal,
+      )
+      const contextWindow = info.context?.contextWindow
+      if (contextWindow === undefined) return persisted
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        contextWindow,
+        ...(info.systemPromptUpdate === undefined
+          ? {}
+          : { systemPromptUpdate: info.systemPromptUpdate }),
+      }
+    } catch {
+      return persisted
+    }
   }
 
   /** Reuse the host's native pruning transaction before spending the fallback reserve. */
@@ -278,22 +356,40 @@ export class ContextRolloverEngine extends CompactionEngine {
           e.data.source.summary === marker,
       )
   }
-  private header(agent: Agent, assembly: PromptAssembly): EpochHeader {
+  private header(
+    agent: Agent,
+    assembly: PromptAssembly,
+    explicitSelection?: Readonly<ModelSelection>,
+  ): EpochHeader {
+    const prev = agent.session.requestHeader()
+    const { tools: _prevTools, ...prevRest } = prev ?? {}
+    const selection = this.selectionOf(agent, explicitSelection)
+    const provider =
+      selection?.provider ?? prev?.config.provider ?? agent.options.provider ?? ''
+    const model =
+      selection?.model ?? prev?.config.model ?? agent.options.model ?? ''
+    const reasoningEffort =
+      selection !== undefined
+        ? selection.reasoningEffort
+        : (prev?.config.reasoningEffort ?? agent.options.reasoningEffort)
+    const maxTokens = prev?.config.maxTokens ?? agent.options.maxTokens
+    const {
+      provider: _p,
+      model: _m,
+      reasoningEffort: _r,
+      maxTokens: _t,
+      ...restControls
+    } = prev?.config ?? {}
     return {
-      ...agent.session.requestHeader(),
+      ...prevRest,
       config: {
-        ...agent.options,
-        ...agent.session.requestHeader()?.config,
-        provider:
-          agent.session.requestHeader()?.config.provider ??
-          agent.options.provider ??
-          '',
-        model:
-          agent.session.requestHeader()?.config.model ??
-          agent.options.model ??
-          '',
+        ...restControls,
+        provider,
+        model,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+        ...(maxTokens === undefined ? {} : { maxTokens }),
       },
-      tools: assembly.tools,
+      ...(assembly.tools.length > 0 ? { tools: [...assembly.tools] } : {}),
     }
   }
   private async perform(
@@ -303,12 +399,14 @@ export class ContextRolloverEngine extends CompactionEngine {
     provided?: PromptAssembly,
     owner: 'current-turn' | null = 'current-turn',
     sourceCommandId?: CommandId,
+    explicitSelection?: Readonly<ModelSelection>,
+    explicitModelContext?: BudgetModelContext,
   ): Promise<CompactionResult> {
     signal.throwIfAborted()
     if (reason === 'overflow') this.ctx.get('toolResultPruner')?.pruneSession(agent.session)
     const assembly =
       provided ??
-      (await this.ctx.systemPrompt.assemble(assembleContextFor(agent, signal)))
+      (await this.assembleFor(agent, signal, explicitSelection))
     const session = agent.session
     const range = selectRolloverRange(
       session,
@@ -326,14 +424,18 @@ export class ContextRolloverEngine extends CompactionEngine {
       throw new Error(
         'agent-context: no conversational progress since the previous window; cannot shrink fixed context',
       )
-    if (session.requestContext())
+    const modelContext =
+      explicitModelContext ??
+      (await this.resolveBudgetContext(agent, signal, explicitSelection))
+    if (modelContext)
       budget(
         agent,
         this.ctx.tokenMeter,
         this.config,
         [],
-        this.header(agent, assembly),
+        this.header(agent, assembly, explicitSelection),
         createSystemMessage(renderPrompt(assembly)),
+        modelContext,
       )
 
     return commitRollover(
@@ -367,10 +469,33 @@ export class ContextRolloverEngine extends CompactionEngine {
     signal.throwIfAborted()
     if (trigger === 'context-overflow')
       return this.perform(agent, 'overflow', signal)
-    if (!agent.session.requestContext()) return null
-    const reading = this.prunePressure(agent, () => budget(agent, this.ctx.tokenMeter, this.config))
+    const modelContext = await this.resolveBudgetContext(agent, signal)
+    if (!modelContext) return null
+    const assembly = await this.assembleFor(agent, signal)
+    const header = this.header(agent, assembly)
+    const systemMessage = createSystemMessage(renderPrompt(assembly))
+    const reading = this.prunePressure(agent, () =>
+      budget(
+        agent,
+        this.ctx.tokenMeter,
+        this.config,
+        [],
+        header,
+        systemMessage,
+        modelContext,
+      ),
+    )
     if (reading.T < reading.H) return null
-    return this.perform(agent, 'pressure', signal)
+    return this.perform(
+      agent,
+      'pressure',
+      signal,
+      assembly,
+      'current-turn',
+      undefined,
+      undefined,
+      modelContext,
+    )
   }
   /** Manually reset an idle Agent under its public maintenance lease. */
   override async compactNow(

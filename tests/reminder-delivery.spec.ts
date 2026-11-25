@@ -59,7 +59,13 @@ it('delivers reminder and fallback once per window, with committed references, i
   } as Agent
   const decision = await agentEvents(fresh, carrier).waterfall(
     'agent/pre-step',
-    { messages: [], turn: 5, step: 1, signal: new AbortController().signal },
+    {
+      messages: [],
+      turn: 5,
+      step: 1,
+      signal: new AbortController().signal,
+      modelSelection: { provider: 'mock', model: 'mock' },
+    },
     async () => ({ kind: 'enter' as const, messages: [] }),
   )
   expect(decision).toMatchObject({ kind: 'enter', messages: [] })

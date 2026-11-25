@@ -2,8 +2,22 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { EpochHeader } from '@deepseek-ai/dsh-session'
 import { estimateToolsTokens } from '@deepseek-ai/dsh-token-meter/estimate'
-import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { Message, SystemPromptUpdate, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { ResolvedRolloverConfig } from './config.ts'
+
+export interface BudgetModelContext {
+  readonly provider: string
+  readonly model: string
+  readonly contextWindow?: number
+  readonly systemPromptUpdate?: SystemPromptUpdate
+}
+
+function messageText(message: Message | undefined): string {
+  if (!message || message.content.length === 0) return ''
+  const [block] = message.content
+  return message.content.length === 1 && block?.type === 'text' ? block.text : ''
+}
+
 /** Estimate budget at the specified public admission seam, replacing the header rather than double counting tools. */
 export function budget(
   agent: Agent,
@@ -12,9 +26,10 @@ export function budget(
   messages: readonly UserMessage[] = [],
   header?: EpochHeader,
   systemMessage?: Message,
+  modelContext?: BudgetModelContext,
 ) {
   const session = agent.session
-  const context = session.requestContext()
+  const context = modelContext ?? session.requestContext()
   const C = context?.contextWindow
   if (C === undefined || !Number.isFinite(C) || C <= 0)
     throw new Error('agent-context: a valid model contextWindow is required')
@@ -52,8 +67,10 @@ export function budget(
   const measurement = meter.measure(session, header)
   const surface = session.deriveMessages()
   const persisted = new Set(surface.map((m) => m.id))
-  const previousSystem = surface.findLast((m) => m.role === 'system')
-  const effectiveSystem = systemMessage ?? previousSystem
+  const systemMessages = surface.filter((m) => m.role === 'system')
+  const latestSystem =
+    systemMessages.findLast((m) => messageText(m) !== '') ?? systemMessages[0]
+  const effectiveSystem = systemMessage ?? latestSystem
   const runtime = [...surface, ...messages].findLast((m) =>
     ['runtime-context', 'compact-checkpoint'].includes(m.source.kind),
   )
@@ -65,10 +82,21 @@ export function budget(
     throw new Error(
       'agent-context: fixed system/tools/runtime context exceeds work budget',
     )
-  const systemDelta = systemMessage
-    ? meter.estimateMessage(systemMessage) -
-      (previousSystem ? meter.estimateMessage(previousSystem) : 0)
-    : 0
+  const currentSystemTokens = systemMessages.reduce(
+    (n, m) => n + meter.estimateMessage(m),
+    0,
+  )
+  const renderedSystemText = messageText(systemMessage)
+  const systemDelta = !systemMessage
+    ? 0
+    : systemMessages.length === 0
+      ? meter.estimateMessage(systemMessage)
+      : context?.systemPromptUpdate === 'in-history' &&
+          renderedSystemText.length > 0
+        ? messageText(latestSystem) === renderedSystemText
+          ? 0
+          : meter.estimateMessage(systemMessage)
+        : meter.estimateMessage(systemMessage) - currentSystemTokens
   const T =
     measurement.totalTokens +
     systemDelta +

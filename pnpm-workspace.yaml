@@ -1,3 +1,4 @@
 autoInstallPeers: false
 allowBuilds:
   esbuild: true
+  koffi: false
